@@ -1,6 +1,6 @@
 """
 Simple in-memory sliding-window rate limiter. Sufficient for hackathon
-scope (single process, single Render instance) — no Redis needed.
+scope (single process, single Railway instance) — no Redis needed.
 Applied to the trigger-recovery endpoint to stop a burst of manual
 clicks or retried webhook-driven triggers from spamming recovery
 checkouts for the same customer.

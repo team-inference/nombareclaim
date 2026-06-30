@@ -1,7 +1,7 @@
 """
 Central settings object. Everything here is loaded from environment
 variables. Nothing in this file should ever contain a real secret —
-real values live in `.env` locally (gitignored) and in Render's
+real values live in `.env` locally (gitignored) and in Railway's
 environment variable dashboard in production.
 """
 import os

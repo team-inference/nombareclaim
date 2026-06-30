@@ -24,6 +24,11 @@ events that create FailureEvent rows, and inbound success events that
 through the same signature verification path before anything else
 happens.
 
+**Deployment**: the backend runs on Railway (root directory `/backend`,
+Python auto-detected via `requirements.txt`, start command from the
+included `Procfile`). All secrets are set as Railway environment
+variables, never committed — see section 6.
+
 ## 2. HMAC signature verification
 
 Every inbound request to `/webhooks/nomba` is verified before any
@@ -119,7 +124,7 @@ only trigger a lookup.
   anywhere in the codebase.
 - `.env` is in `.gitignore` from the repository's first commit. Only
   `.env.example`, with empty values, is committed.
-- In production, the same variables are set directly in Render's
+- In production, the same variables are set directly in Railway's
   environment variable dashboard, never in a committed file.
 - **TEST credentials only** are used for all development, the July 3
   checkpoint, and the demo recording. There is no live-money path
