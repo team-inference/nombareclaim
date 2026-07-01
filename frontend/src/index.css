@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  /* --- Token system ---
+     Ledger palette: a quiet warm-paper neutral shell (not pure white,
+     not the generic AI cream #F4F1EA) with one decisive teal accent.
+     Teal reads as "money recovered" without being a literal green
+     checkmark cliché, and nods toward Nomba's own brand color without
+     copying it outright. */
+  --color-paper: #FAFAF8;
+  --color-surface: #FFFFFF;
+  --color-line: #E7E5DE;
+  --color-ink: #14171F;
+  --color-ink-muted: #5B6472;
+  --color-ink-faint: #8B92A0;
+
+  --color-action: #0F6E5C;
+  --color-action-hover: #0C5A4B;
+  --color-action-soft: #E6F4F1;
+
+  --color-status-new-fg: #5B6472;
+  --color-status-new-bg: #F1F1ED;
+  --color-status-classified-fg: #2B5FA0;
+  --color-status-classified-bg: #EAF1FB;
+  --color-status-triggered-fg: #9A6B0F;
+  --color-status-triggered-bg: #FBF1DC;
+  --color-status-recovered-fg: #0F6E5C;
+  --color-status-recovered-bg: #E6F4F1;
+  --color-status-expired-fg: #9B4040;
+  --color-status-expired-bg: #F7EBEA;
+
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-ledger: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+body {
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-ledger {
+  font-family: var(--font-ledger);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Visible keyboard focus, kept everywhere — not just default browser blue */
+:focus-visible {
+  outline: 2px solid var(--color-action);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@keyframes row-flash {
+  0% { background-color: var(--color-action-soft); }
+  100% { background-color: transparent; }
+}
+
+.animate-row-flash {
+  animation: row-flash 1.8s ease-out;
+}
