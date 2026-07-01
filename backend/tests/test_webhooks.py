@@ -1,25 +1,24 @@
+import hashlib
+import hmac
 import json
 import os
-import time
 
 # Set required env vars before importing the app so config picks them up.
-os.environ.setdefault("NOMBA_WEBHOOK_SIGNATURE_KEY", "test_signature_key_123")
+os.environ.setdefault("NOMBA_WEBHOOK_SIGNATURE_KEY", "test_webhook_secret_123")
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test_nombareclaim.db")
 os.environ.setdefault("NOMBA_ACCOUNT_ID", "test-account")
 os.environ.setdefault("NOMBA_SUBACCOUNT_ID", "test-subaccount")
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.signature import compute_signature
 from app.database import init_db
 
 init_db()  # ensure tables exist (equivalent to FastAPI's startup event)
 
 client = TestClient(app)
 
-SIGNATURE_KEY = "test_signature_key_123"
+SIGNATURE_KEY = "test_webhook_secret_123"
 
 PAYLOAD = {
     "event_type": "payment_failed",
@@ -38,10 +37,9 @@ PAYLOAD = {
 }
 
 
-def _signed_headers(payload: dict) -> dict:
-    timestamp = str(int(time.time()))
-    sig = compute_signature(payload, timestamp, SIGNATURE_KEY)
-    return {"signature": sig, "timestamp": timestamp, "Content-Type": "application/json"}
+def _signed_headers(raw_body: bytes) -> dict:
+    sig = hmac.new(SIGNATURE_KEY.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return {"nomba-signature": sig, "Content-Type": "application/json"}
 
 
 def test_health():
@@ -56,17 +54,22 @@ def test_unsigned_webhook_returns_401_and_does_not_crash():
 
 
 def test_malformed_json_returns_400_not_500():
+    # A malformed body still needs a VALID signature to get past
+    # verification first (verification now happens before JSON
+    # parsing) — sign the malformed bytes themselves, then confirm the
+    # JSON parse step is what correctly rejects it with 400.
+    bad_body = b"{not valid json"
     resp = client.post(
         "/webhooks/nomba",
-        data=b"{not valid json",
-        headers={"Content-Type": "application/json"},
+        content=bad_body,
+        headers=_signed_headers(bad_body),
     )
     assert resp.status_code == 400
 
 
 def test_valid_signed_webhook_is_accepted_and_stored():
-    headers = _signed_headers(PAYLOAD)
-    resp = client.post("/webhooks/nomba", content=json.dumps(PAYLOAD), headers=headers)
+    raw_body = json.dumps(PAYLOAD).encode("utf-8")
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "received"
@@ -74,15 +77,18 @@ def test_valid_signed_webhook_is_accepted_and_stored():
 
 
 def test_duplicate_delivery_is_not_reprocessed():
-    headers = _signed_headers(PAYLOAD)
-    body_str = json.dumps(PAYLOAD)
+    raw_body = json.dumps(PAYLOAD).encode("utf-8")
+    headers = _signed_headers(raw_body)
 
-    first = client.post("/webhooks/nomba", content=body_str, headers=headers)
+    first = client.post("/webhooks/nomba", content=raw_body, headers=headers)
     assert first.status_code == 200
 
     # Re-send the exact same event (same idempotency key) — simulates
     # Nomba's retry/backoff redelivering an already-processed event.
-    second = client.post("/webhooks/nomba", content=body_str, headers=headers)
+    # This is also the ONLY replay defense in this system, matching
+    # Nomba's own documented recommendation (idempotency on
+    # event.requestId) rather than a timestamp freshness window.
+    second = client.post("/webhooks/nomba", content=raw_body, headers=headers)
     assert second.status_code == 200
     assert second.json().get("status") == "duplicate_ignored"
 

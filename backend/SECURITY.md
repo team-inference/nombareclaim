@@ -12,7 +12,7 @@ corresponding file.
 
 ```
 Nomba (webhook) -> POST /webhooks/nomba -> verify signature -> store FailureEvent
-                                                              -> background: classify (rules + Gemini)
+                                                              -> background: classify (rules + Gemini/Groq)
 Merchant dashboard -> GET /api/summary, /api/failures -> read from FailureEvent table
                     -> POST /api/failures/{id}/trigger-recovery -> Nomba Checkout API -> recovery link
 Nomba (webhook, payment_success on the recovery checkout) -> server-side transaction lookup -> mark RECOVERED
@@ -34,55 +34,51 @@ variables, never committed — see section 6.
 Every inbound request to `/webhooks/nomba` is verified before any
 business logic runs, in `app/services/signature.py`.
 
+**This section is now confirmed against Nomba's own official training
+documentation** (training.nomba.com > Webhooks module), not inferred —
+an earlier draft of this system had to guess at parts of this scheme;
+that guess has since been replaced with their documented reference
+implementation, matched exactly.
+
 - **Algorithm**: HMAC-SHA256, hex-encoded.
-- **What's hashed**: a colon-joined string built from eight fields, in
-  this exact order — `event_type`, `requestId`,
-  `data.merchant.userId`, `data.merchant.walletId`,
-  `data.transaction.transactionId`, `data.transaction.type`,
-  `data.transaction.time`, `data.transaction.responseCode` — with the
-  request timestamp appended as a ninth colon-joined value. This field
-  list and order is taken from Nomba's documented signature
-  verification pattern and cross-checked against their real published
-  webhook payload shape (which confirms those exact field names exist
-  at those exact paths).
-- **Where the signature lives**: a request header, compared against the
-  locally-computed digest. The header *names* (`NOMBA_SIGNATURE_HEADER`,
-  `NOMBA_TIMESTAMP_HEADER` in `.env`) are configurable rather than
-  hardcoded, because Nomba's public docs render their sample-code tabs
-  client-side and the literal header strings weren't independently
-  confirmable from the page content alone. **Action item before the
-  July 3 checkpoint**: send one real test webhook from the Nomba
-  dashboard and read the literal header names off that delivery, then
-  set the two env vars to match. This is an honest, explicitly-flagged
-  gap, not a guess presented as fact.
+- **What's hashed**: the raw, unparsed request body bytes — exactly as
+  received, before any JSON parsing happens. This matters: hashing a
+  re-serialized version of the parsed JSON can produce a different
+  byte sequence than what was actually sent (whitespace, key
+  ordering), which would make a genuinely valid signature look
+  invalid. The raw body is captured first and signature verification
+  runs against those exact bytes; JSON parsing only happens afterward,
+  once the signature has already passed.
+- **Where the signature lives**: a single request header,
+  `nomba-signature`, compared against the locally-computed digest.
+  Nomba's own sample code confirms this is the only header involved —
+  there is no separate timestamp header in their scheme.
+- **The secret**: referred to in this codebase as
+  `NOMBA_WEBHOOK_SIGNATURE_KEY`, matching what Nomba calls
+  `NOMBA_WEBHOOK_SECRET` in their own sample — the secret Nomba
+  generates when you register a webhook URL on their dashboard.
 - **Comparison**: `hmac.compare_digest`, never `==`, to avoid leaking
   timing information about how many bytes of a forged signature were
   correct.
 - **Failure mode**: any verification failure (bad signature, missing
-  header, missing required payload field) returns `401` immediately.
-  The response body never echoes the computed or expected signature,
-  the signing key, or *why specifically* verification failed beyond a
-  generic reason — an attacker probing the endpoint learns nothing
-  useful from a failed attempt.
-
-**Known limitation, stated plainly**: `amount` is not one of the eight
-fields Nomba's documented algorithm signs. In practice this is low risk
-because the request also travels over HTTPS (which protects payload
-integrity in transit independent of the application-level signature),
-but it means the HMAC alone is not a guarantee that `amount` specifically
-wasn't altered between Nomba and this server. This is exactly why this
-system never finalizes a `RECOVERED` status from webhook data alone —
-see section 5.
+  header) returns `401` immediately. The response body never echoes
+  the computed or expected signature, the signing key, or *why
+  specifically* verification failed beyond a generic reason — an
+  attacker probing the endpoint learns nothing useful from a failed
+  attempt.
 
 ## 3. Replay protection
 
-The request timestamp (carried in a header, not trusted from inside the
-JSON body — a value inside the body the attacker controls is not a
-useful freshness signal) must fall within `REPLAY_WINDOW_SECONDS` (300s
-/ 5 minutes by default) of the server's current time, or the request is
-rejected with `401` before signature comparison even runs. This bounds
-how long a captured, validly-signed request could be replayed by an
-attacker who intercepted it.
+Nomba's own webhook documentation does not implement timestamp-based
+replay protection — their reference sample has no timestamp header at
+all. Instead, they explicitly recommend idempotency on
+`event.requestId`: ignore an event if that requestId has already been
+processed. This system implements exactly that (see section 4) as its
+replay defense, rather than a freshness-window check that Nomba's own
+scheme doesn't support. A captured, validly-signed request replayed
+later is caught here, not by a timestamp — the second delivery carries
+the same `requestId` and is detected and ignored before any
+reprocessing happens.
 
 ## 4. Idempotency
 
@@ -183,15 +179,23 @@ implied to be production-grade.
 
 - **Classification** (`app/services/classification.py`) is deterministic
   wherever Nomba's response code maps unambiguously to a failure
-  reason (a dict lookup against `RESPONSE_CODE_MAP`). Gemini is called
-  to classify only the genuinely ambiguous remainder.
+  reason (a dict lookup against `RESPONSE_CODE_MAP`). AI is called
+  only to classify the genuinely ambiguous remainder.
 - **Recovery score** is a deterministic, explainable function of
   classification type plus a mild amount-based adjustment — not a
   trained model and not opaque.
-- **Recovery message text** is always Gemini-generated (never
-  templated for the live demo unless the API call itself fails, in
-  which case a clearly-labeled fallback template is used so the
-  pipeline degrades gracefully instead of breaking).
+- **Recovery message text** is always AI-generated (never templated
+  for the live demo unless every AI call fails, in which case a
+  clearly-labeled fallback template is used so the pipeline degrades
+  gracefully instead of breaking).
+- **AI provider chain**: Gemini is tried first; Groq is tried only if
+  Gemini is unconfigured or its call fails for any reason; a plain
+  deterministic template is the final fallback if both AI providers
+  are unavailable. Every provider call catches its own exceptions and
+  returns nothing rather than raising, so a third-party AI outage can
+  never break webhook ingestion — worst case, the message is a
+  template instead of AI-written, but the failure event is still
+  captured, classified by rules, and shown on the dashboard.
 
 ## 11. Honest scope statement
 

@@ -1,29 +1,41 @@
 """
-Nomba webhook HMAC signature verification.
+Nomba webhook signature verification.
 
-Field order and the colon-joined construction here follow the pattern
-documented at developer.nomba.com/products/webhooks/signature-verification-new
-and the real webhook payload shape published at
-developer.nomba.com/products/webhooks/introduction, which confirms the
-payload carries event_type, requestId, data.merchant.{userId,walletId}
-and data.transaction.{transactionId,type,time,responseCode}.
+CONFIRMED against Nomba's own official training documentation
+(training.nomba.com, "Webhooks" module) — this is no longer a
+best-guess implementation, it matches their documented Node.js
+reference sample exactly:
 
-What was NOT independently confirmable from public docs (the sample-code
-tabs on that page render client-side and weren't fetchable): the exact
-literal header names Nomba uses to carry the signature and the request
-timestamp. Do not guess past this point — send one real test webhook
-from the Nomba dashboard (Webhooks > your webhook > Logs, or "Send test
-event" if available) and read the literal header names off that
-delivery. Then set NOMBA_SIGNATURE_HEADER / NOMBA_TIMESTAMP_HEADER in
-.env to match — no code change needed. Until confirmed, this defaults
-to "signature" and "timestamp", which are Nomba's own field names for
-these two concepts elsewhere in their docs, but treat that as a
-best-guess default, not a verified fact, and say so plainly in the
-SECURITY.md / demo if asked.
+    const signature = req.header("nomba-signature");
+    const expected = crypto
+      .createHmac("sha256", process.env.NOMBA_WEBHOOK_SECRET)
+      .update(req.body)      // the RAW request body, not a
+      .digest("hex");        // reconstructed/reserialized payload
+
+    if (signature !== expected) return res.status(401).send("bad signature");
+
+Two things this confirms and corrects versus an earlier draft of this
+file:
+1. There is exactly ONE header (`nomba-signature`), not a separate
+   signature + timestamp pair. Nomba's own sample does not implement
+   timestamp-based replay protection at all.
+2. The HMAC is computed over the raw, unparsed request body bytes —
+   NOT a colon-joined reconstruction of individual JSON fields. This
+   matters: hashing a re-serialized version of the parsed JSON can
+   produce a different byte sequence than what was actually sent
+   (whitespace, key order), which would make a genuinely valid
+   signature appear invalid. The raw body must be captured before any
+   JSON parsing happens, and hashed as-is.
+
+Replay protection: Nomba's own documentation recommends idempotency
+via `event.requestId` — ignore an event if that requestId has already
+been processed — rather than a timestamp freshness window. This
+system implements exactly that (see app/routes/webhooks.py's
+idempotency_key check), so no separate timestamp-based replay check is
+needed or attempted here.
 """
 import hashlib
 import hmac
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,7 +47,7 @@ class SignatureVerificationError(Exception):
 
 
 @dataclass
-class VerifiedEvent:
+class ParsedEvent:
     event_type: str
     request_id: str
     merchant_user_id: Optional[str]
@@ -55,89 +67,37 @@ def _safe_get(d: dict, *path, default=None):
     return cur
 
 
-def build_signing_string(payload: dict, timestamp: str) -> str:
-    """
-    Colon-joined string of, in order:
-    event_type : requestId : data.merchant.userId : data.merchant.walletId
-    : data.transaction.transactionId : data.transaction.type
-    : data.transaction.time : data.transaction.responseCode : <timestamp>
-
-    Missing fields are represented as empty strings rather than the
-    literal "None" so the hash is stable and reproducible by hand for
-    the unit test.
-    """
-    fields = [
-        payload.get("event_type", ""),
-        payload.get("requestId", ""),
-        _safe_get(payload, "data", "merchant", "userId", default=""),
-        _safe_get(payload, "data", "merchant", "walletId", default=""),
-        _safe_get(payload, "data", "transaction", "transactionId", default=""),
-        _safe_get(payload, "data", "transaction", "type", default=""),
-        _safe_get(payload, "data", "transaction", "time", default=""),
-        _safe_get(payload, "data", "transaction", "responseCode", default=""),
-    ]
-    fields = [str(f) if f is not None else "" for f in fields]
-    return ":".join(fields) + ":" + str(timestamp)
-
-
-def compute_signature(payload: dict, timestamp: str, signature_key: str) -> str:
-    message = build_signing_string(payload, timestamp)
-    digest = hmac.new(
-        key=signature_key.encode("utf-8"),
-        msg=message.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    return digest
-
-
-def verify_nomba_signature(
-    payload: dict,
+def verify_signature(
+    raw_body: bytes,
     headers: dict,
-    signature_key: str,
-    signature_header: str = "signature",
-    timestamp_header: str = "timestamp",
-    replay_window_seconds: int = 300,
-) -> VerifiedEvent:
+    secret: str,
+    signature_header: str = "nomba-signature",
+) -> None:
     """
-    Raises SignatureVerificationError on any failure. Returns a
-    VerifiedEvent with the extracted fields on success. Headers dict is
-    expected lowercased (FastAPI's Headers object is already
-    case-insensitive on lookup, but we normalize defensively here since
-    Nomba's own docs note header names are case-insensitive).
+    Raises SignatureVerificationError on any failure. Returns nothing —
+    a clean return means the signature is valid. Must be called with
+    the RAW bytes exactly as received, before any JSON parsing.
     """
     headers = {k.lower(): v for k, v in headers.items()}
-
     received_signature = headers.get(signature_header.lower())
-    timestamp = headers.get(timestamp_header.lower())
 
     if not received_signature:
         raise SignatureVerificationError("missing signature header")
-    if not timestamp:
-        raise SignatureVerificationError("missing timestamp header")
-    if not signature_key:
-        raise SignatureVerificationError("server misconfigured: no signature key set")
+    if not secret:
+        raise SignatureVerificationError("server misconfigured: no webhook secret set")
 
-    # Replay protection: reject anything outside the freshness window.
-    try:
-        ts_value = float(timestamp)
-        # Nomba timestamps could plausibly be seconds or milliseconds;
-        # normalize milliseconds down to seconds if it looks too large
-        # to be a sane Unix-seconds value.
-        if ts_value > 1e12:
-            ts_value = ts_value / 1000.0
-    except (TypeError, ValueError):
-        raise SignatureVerificationError("invalid timestamp header")
-
-    now = time.time()
-    if abs(now - ts_value) > replay_window_seconds:
-        raise SignatureVerificationError("timestamp outside replay window")
-
-    expected = compute_signature(payload, timestamp, signature_key)
+    expected = hmac.new(key=secret.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected, received_signature):
         raise SignatureVerificationError("signature mismatch")
 
-    return VerifiedEvent(
+
+def extract_event(payload: dict) -> ParsedEvent:
+    """Pulls the fields this system needs out of an already-verified,
+    already-JSON-parsed payload. Kept separate from verify_signature()
+    since verification must happen on raw bytes, while field extraction
+    naturally happens on the parsed dict afterwards."""
+    return ParsedEvent(
         event_type=payload.get("event_type", ""),
         request_id=payload.get("requestId", ""),
         merchant_user_id=_safe_get(payload, "data", "merchant", "userId"),

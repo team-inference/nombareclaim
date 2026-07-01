@@ -5,10 +5,20 @@ Design (and the line to give judges if asked "how does the AI actually
 decide"): classification of *why* a payment failed is deterministic
 wherever Nomba's responseCode/transaction type give an unambiguous
 signal — that's a dict lookup, not a model call, and it's instant and
-free. Gemini is used for exactly two things: (1) breaking ties when the
+free. AI is used for exactly two things: (1) breaking ties when the
 response code is ambiguous or unrecognised, and (2) writing the
 free-text recovery message, which is always model-generated because it
 needs to read like a human wrote it, not like a templated string.
+
+AI provider chain: Gemini is tried first, Groq second (only if Gemini
+is unconfigured or its call fails for any reason), and a plain
+deterministic template last. Nothing about webhook ingestion ever
+blocks on or breaks from an AI call failing — every provider function
+below catches its own exceptions and returns None rather than raising,
+so classify_failure() can always fall through to the next option in
+the chain and, worst case, land on the template. This is deliberate:
+a flaky third-party AI API should never be able to take down the
+webhook receiver.
 
 The response-code mapping below is a best-effort table built from
 common PSP/processor response code conventions (Nomba's own full
@@ -19,9 +29,10 @@ support request to Nomba — the code is structured so that's a one-place
 edit (RESPONSE_CODE_MAP below), nothing else needs to change.
 """
 import json
-import os
 from dataclasses import dataclass
 from typing import Optional
+
+import httpx
 
 from app.config import settings
 from app.models import Classification
@@ -123,48 +134,101 @@ def _gemini_message(classification: Classification, amount: int, currency: str) 
 
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL)
-        prompt = (
-            "Write a short, warm, Nigerian-English recovery message a merchant "
-            "could send a customer whose payment just failed. 1-2 sentences. "
-            "Plain text only, no markdown, no preamble, no quotation marks.\n"
-            f"Failure reason: {classification.value}\n"
-            f"Amount: {currency} {amount}\n"
-            "Merchant name: [Merchant]\n"
-        )
+        prompt = _message_prompt(classification, amount, currency)
         response = model.generate_content(prompt)
         text = (response.text or "").strip()
         return text or None
     except Exception:
-        # Never let a flaky AI call break webhook ingestion. Fall back
-        # to the deterministic template instead.
+        # Never let a flaky AI call break webhook ingestion. Returning
+        # None lets classify_failure() fall through to Groq, then the
+        # deterministic template.
         return None
 
 
 def _gemini_classify_ambiguous(
     response_code: Optional[str], transaction_type: Optional[str], raw_payload: dict
-) -> Classification:
+) -> Optional[Classification]:
     if not settings.GEMINI_API_KEY:
-        return Classification.OTHER
+        return None
     try:
         import google.generativeai as genai
 
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL)
-        prompt = (
-            "Classify a failed Nigerian payment transaction into exactly one of: "
-            "INSUFFICIENT_FUNDS, CARD_DECLINED, NETWORK_TIMEOUT, USER_ABANDONED, OTHER.\n"
-            f"Response code: {response_code}\n"
-            f"Transaction type: {transaction_type}\n"
-            f"Raw payload (truncated): {json.dumps(raw_payload)[:1500]}\n"
-            "Reply with ONLY the single classification label, nothing else."
-        )
+        prompt = _classify_prompt(response_code, transaction_type, raw_payload)
         response = model.generate_content(prompt)
         label = (response.text or "").strip().upper()
-        if label in Classification.__members__:
-            return Classification[label]
-        return Classification.OTHER
+        return Classification[label] if label in Classification.__members__ else None
     except Exception:
-        return Classification.OTHER
+        return None
+
+
+def _message_prompt(classification: Classification, amount: int, currency: str) -> str:
+    return (
+        "Write a short, warm, Nigerian-English recovery message a merchant "
+        "could send a customer whose payment just failed. 1-2 sentences. "
+        "Plain text only, no markdown, no preamble, no quotation marks.\n"
+        f"Failure reason: {classification.value}\n"
+        f"Amount: {currency} {amount}\n"
+        "Merchant name: [Merchant]\n"
+    )
+
+
+def _classify_prompt(response_code: Optional[str], transaction_type: Optional[str], raw_payload: dict) -> str:
+    return (
+        "Classify a failed Nigerian payment transaction into exactly one of: "
+        "INSUFFICIENT_FUNDS, CARD_DECLINED, NETWORK_TIMEOUT, USER_ABANDONED, OTHER.\n"
+        f"Response code: {response_code}\n"
+        f"Transaction type: {transaction_type}\n"
+        f"Raw payload (truncated): {json.dumps(raw_payload)[:1500]}\n"
+        "Reply with ONLY the single classification label, nothing else."
+    )
+
+
+def _groq_chat(prompt: str) -> Optional[str]:
+    """Shared Groq call: OpenAI-compatible chat completions endpoint.
+    Uses plain httpx rather than an SDK, since it's a single endpoint
+    and this avoids adding a new dependency for one call shape."""
+    if not settings.GROQ_API_KEY:
+        return None
+    try:
+        resp = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings.GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens": 120,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        return text or None
+    except Exception:
+        # Same rule as the Gemini functions: swallow everything, return
+        # None, let classify_failure() fall through to the template.
+        return None
+
+
+def _groq_message(classification: Classification, amount: int, currency: str) -> Optional[str]:
+    return _groq_chat(_message_prompt(classification, amount, currency))
+
+
+def _groq_classify_ambiguous(
+    response_code: Optional[str], transaction_type: Optional[str], raw_payload: dict
+) -> Optional[Classification]:
+    text = _groq_chat(_classify_prompt(response_code, transaction_type, raw_payload))
+    if not text:
+        return None
+    label = text.strip().upper()
+    return Classification[label] if label in Classification.__members__ else None
 
 
 def classify_failure(
@@ -176,12 +240,20 @@ def classify_failure(
     raw_payload: dict,
 ) -> ClassificationResult:
     classification = _deterministic_classification(response_code, transaction_type, event_type)
+
     if classification is None:
         classification = _gemini_classify_ambiguous(response_code, transaction_type, raw_payload)
+    if classification is None:
+        classification = _groq_classify_ambiguous(response_code, transaction_type, raw_payload)
+    if classification is None:
+        classification = Classification.OTHER
 
     score = _score_for(classification, amount)
-    message = _gemini_message(classification, amount, currency) or _fallback_message(
-        classification, amount, currency
+
+    message = (
+        _gemini_message(classification, amount, currency)
+        or _groq_message(classification, amount, currency)
+        or _fallback_message(classification, amount, currency)
     )
 
     return ClassificationResult(

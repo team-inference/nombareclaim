@@ -1,17 +1,16 @@
 import hashlib
 import hmac
-import time
+import json
 
 import pytest
 
 from app.services.signature import (
-    verify_nomba_signature,
-    compute_signature,
-    build_signing_string,
+    verify_signature,
+    extract_event,
     SignatureVerificationError,
 )
 
-FAKE_SECRET = "test_signature_key_123"
+FAKE_SECRET = "test_webhook_secret_123"
 
 SAMPLE_PAYLOAD = {
     "event_type": "payment_failed",
@@ -32,72 +31,72 @@ SAMPLE_PAYLOAD = {
     },
 }
 
-
-def test_signing_string_field_order():
-    s = build_signing_string(SAMPLE_PAYLOAD, "1719739200")
-    assert s == (
-        "payment_failed:req-abc-123:user-1:wallet-1:txn-1:"
-        "vact_transfer:2026-06-30T10:00:00Z:51:1719739200"
-    )
+# Encoded once, reused everywhere — signature must be computed over
+# these EXACT bytes, matching how FastAPI's request.body() would hand
+# them to us before any JSON parsing happens.
+RAW_BODY = json.dumps(SAMPLE_PAYLOAD).encode("utf-8")
 
 
-def test_compute_signature_matches_hand_computed_hmac():
-    timestamp = "1719739200"
-    message = build_signing_string(SAMPLE_PAYLOAD, timestamp)
+def _sign(raw_body: bytes, secret: str = FAKE_SECRET) -> str:
+    return hmac.new(key=secret.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256).hexdigest()
 
-    # Hand-computed using Python's stdlib hmac directly, independent of
-    # the implementation under test, with the same fake secret.
-    expected = hmac.new(
-        key=FAKE_SECRET.encode("utf-8"),
-        msg=message.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
 
-    actual = compute_signature(SAMPLE_PAYLOAD, timestamp, FAKE_SECRET)
-    assert actual == expected
+def test_signature_matches_nomba_documented_scheme():
+    # Hand-computed independently of the implementation under test,
+    # confirming HMAC-SHA256 over the raw body — exactly Nomba's own
+    # documented Node.js sample (crypto.createHmac('sha256', secret)
+    # .update(req.body).digest('hex')).
+    real_expected = hmac.new(FAKE_SECRET.encode(), RAW_BODY, hashlib.sha256).hexdigest()
+    assert _sign(RAW_BODY) == real_expected
 
 
 def test_verify_accepts_valid_signature():
-    timestamp = str(int(time.time()))
-    sig = compute_signature(SAMPLE_PAYLOAD, timestamp, FAKE_SECRET)
-    headers = {"signature": sig, "timestamp": timestamp}
-
-    verified = verify_nomba_signature(
-        SAMPLE_PAYLOAD, headers, FAKE_SECRET, "signature", "timestamp", 300
-    )
-    assert verified.event_type == "payment_failed"
-    assert verified.transaction_id == "txn-1"
+    sig = _sign(RAW_BODY)
+    headers = {"nomba-signature": sig}
+    # Should not raise.
+    verify_signature(RAW_BODY, headers, FAKE_SECRET)
 
 
-def test_verify_rejects_tampered_payload():
-    timestamp = str(int(time.time()))
-    sig = compute_signature(SAMPLE_PAYLOAD, timestamp, FAKE_SECRET)
-    headers = {"signature": sig, "timestamp": timestamp}
+def test_verify_is_case_insensitive_on_header_name():
+    sig = _sign(RAW_BODY)
+    headers = {"Nomba-Signature": sig}
+    verify_signature(RAW_BODY, headers, FAKE_SECRET)
 
-    tampered = dict(SAMPLE_PAYLOAD)
-    tampered["data"] = dict(SAMPLE_PAYLOAD["data"])
-    tampered["data"]["transaction"] = dict(SAMPLE_PAYLOAD["data"]["transaction"])
-    # transactionId IS one of the 8 fields in the signed string (unlike
-    # amount, which Nomba's documented field list does NOT include —
-    # see the note in services/signature.py about what this means for
-    # amount-tampering risk on the recovery flow).
-    tampered["data"]["transaction"]["transactionId"] = "txn-attacker-substituted"
+
+def test_verify_rejects_tampered_body():
+    sig = _sign(RAW_BODY)
+    headers = {"nomba-signature": sig}
+
+    tampered_body = json.dumps({**SAMPLE_PAYLOAD, "event_type": "payment_success"}).encode("utf-8")
 
     with pytest.raises(SignatureVerificationError):
-        verify_nomba_signature(tampered, headers, FAKE_SECRET, "signature", "timestamp", 300)
+        verify_signature(tampered_body, headers, FAKE_SECRET)
 
 
 def test_verify_rejects_missing_signature_header():
-    timestamp = str(int(time.time()))
-    headers = {"timestamp": timestamp}
     with pytest.raises(SignatureVerificationError):
-        verify_nomba_signature(SAMPLE_PAYLOAD, headers, FAKE_SECRET, "signature", "timestamp", 300)
+        verify_signature(RAW_BODY, {}, FAKE_SECRET)
 
 
-def test_verify_rejects_stale_timestamp():
-    old_timestamp = str(int(time.time()) - 3600)  # 1 hour old
-    sig = compute_signature(SAMPLE_PAYLOAD, old_timestamp, FAKE_SECRET)
-    headers = {"signature": sig, "timestamp": old_timestamp}
-
+def test_verify_rejects_wrong_secret():
+    sig = _sign(RAW_BODY, secret="the_real_secret")
+    headers = {"nomba-signature": sig}
     with pytest.raises(SignatureVerificationError):
-        verify_nomba_signature(SAMPLE_PAYLOAD, headers, FAKE_SECRET, "signature", "timestamp", 300)
+        verify_signature(RAW_BODY, headers, "a_different_secret")
+
+
+def test_extract_event_pulls_expected_fields():
+    event = extract_event(SAMPLE_PAYLOAD)
+    assert event.event_type == "payment_failed"
+    assert event.request_id == "req-abc-123"
+    assert event.transaction_id == "txn-1"
+    assert event.response_code == "51"
+    assert event.merchant_user_id == "user-1"
+    assert event.wallet_id == "wallet-1"
+
+
+def test_extract_event_tolerates_missing_fields():
+    event = extract_event({"event_type": "payment_failed"})
+    assert event.event_type == "payment_failed"
+    assert event.transaction_id is None
+    assert event.response_code is None

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import FailureEvent, FailureStatus
-from app.services.signature import verify_nomba_signature, SignatureVerificationError
+from app.services.signature import verify_signature, extract_event, SignatureVerificationError
 from app.services.classification import classify_failure
 from app.services.recovery import confirm_recovery_if_paid
 
@@ -83,22 +83,14 @@ async def receive_nomba_webhook(
     db: Session = Depends(get_db),
 ):
     raw_body = await request.body()
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        logger.warning("rejected webhook: invalid JSON body")
-        return JSONResponse(status_code=400, content={"detail": "invalid JSON"})
 
     headers = dict(request.headers)
-
     try:
-        verified = verify_nomba_signature(
-            payload=payload,
+        verify_signature(
+            raw_body=raw_body,
             headers=headers,
-            signature_key=settings.NOMBA_WEBHOOK_SIGNATURE_KEY,
+            secret=settings.NOMBA_WEBHOOK_SIGNATURE_KEY,
             signature_header=settings.NOMBA_SIGNATURE_HEADER,
-            timestamp_header=settings.NOMBA_TIMESTAMP_HEADER,
-            replay_window_seconds=settings.REPLAY_WINDOW_SECONDS,
         )
     except SignatureVerificationError as e:
         # Do not leak details of *why* verification failed beyond a
@@ -106,6 +98,14 @@ async def receive_nomba_webhook(
         # signature or the signing key.
         logger.warning("rejected webhook: signature verification failed (%s)", str(e))
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        logger.warning("rejected webhook: invalid JSON body")
+        return JSONResponse(status_code=400, content={"detail": "invalid JSON"})
+
+    verified = extract_event(payload)
 
     event_type = verified.event_type
     idempotency_key = f"{event_type}:{verified.transaction_id}:{verified.request_id}"

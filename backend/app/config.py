@@ -28,21 +28,23 @@ class Settings:
     NOMBA_API_BASE_URL: str = os.getenv("NOMBA_API_BASE_URL", "https://api.nomba.com/v1")
 
     # --- Webhook verification ---
+    # CONFIRMED against Nomba's official training documentation
+    # (training.nomba.com > Webhooks): single header "nomba-signature",
+    # HMAC-SHA256 over the raw request body. No timestamp header exists
+    # in their scheme — replay protection is handled via idempotency on
+    # event.requestId instead (see routes/webhooks.py), which is what
+    # Nomba's own docs recommend.
     NOMBA_WEBHOOK_SIGNATURE_KEY: str = os.getenv("NOMBA_WEBHOOK_SIGNATURE_KEY", "")
-
-    # The exact header names Nomba sends the signature/timestamp in were
-    # not confirmable from public docs alone (the docs page renders the
-    # sample code client-side). Confirm these against a real test webhook
-    # delivery in your Nomba dashboard (Webhooks > Logs > a delivery will
-    # show you the literal headers sent) and adjust the env vars below if
-    # they differ — no code change needed, just update these two values.
-    NOMBA_SIGNATURE_HEADER: str = os.getenv("NOMBA_SIGNATURE_HEADER", "signature")
-    NOMBA_TIMESTAMP_HEADER: str = os.getenv("NOMBA_TIMESTAMP_HEADER", "timestamp")
-    REPLAY_WINDOW_SECONDS: int = int(os.getenv("REPLAY_WINDOW_SECONDS", "300"))
+    NOMBA_SIGNATURE_HEADER: str = os.getenv("NOMBA_SIGNATURE_HEADER", "nomba-signature")
 
     # --- AI ---
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    # Second-tier AI fallback: tried only if Gemini is unconfigured or
+    # its call fails. See services/classification.py for the full chain.
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # --- App ---
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./nombareclaim.db")
