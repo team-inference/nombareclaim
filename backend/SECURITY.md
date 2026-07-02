@@ -91,6 +91,19 @@ covered by tests:
    (Nomba retries on any non-2xx response, per their backoff policy)
    is detected before any row is created and returns `200` immediately
    without reprocessing. See `tests/test_webhooks.py::test_duplicate_delivery_is_not_reprocessed`.
+
+   **Event type matching is case-insensitive on purpose.** Nomba's real
+   API docs (event-log endpoint reference) use uppercase values —
+   `PAYMENT_SUCCESS`, `PAYMENT_FAILED` — while a separate training-site
+   example payload used lowercase under a different field name
+   (`"event":"payment_success"`). Neither source is confirmed as the
+   literal shape of a production webhook body, so `event_type` is read
+   from either `event_type` or `event`, and matched against
+   `FAILURE_EVENT_TYPES`/`SUCCESS_EVENT_TYPES` case-insensitively,
+   rather than betting the whole ingestion pipeline on one guess. This
+   is stated here rather than silently handled, and should be
+   simplified back to an exact match once a real webhook delivery
+   confirms the true casing.
 2. **Recovery triggering** (`app/services/recovery.py`): if a
    `FailureEvent` is already `RECOVERY_TRIGGERED` or `RECOVERED`, a
    repeat call to the trigger endpoint returns the existing state
@@ -133,22 +146,79 @@ only trigger a lookup.
 
 ## 7. accountId / sub-account scoping
 
-Every authenticated call to Nomba's API carries two distinct identifiers
-that must not be confused:
+Every authenticated call to Nomba's API carries the **parent
+`accountId`** in the request header (`accountId: <parent>`) — this is
+what Nomba's auth and resource endpoints expect on every call,
+including the token-issue call itself.
 
-- The **parent `accountId`** goes in the request header (`accountId:
-  <parent>`) on every call, including the token-issue call itself —
-  this is what Nomba's auth and most resource endpoints expect.
-- The **sub-account id** is used inside specific request *bodies* where
-  Nomba's API asks which account a resource (like a checkout order) is
-  scoped to — for example, the `accountId` field inside the `order`
-  object when creating a checkout order is the sub-account, not the
-  parent.
+**Correction from an earlier draft of this document**: this system
+previously assumed the checkout order request body also needed a
+sub-account `accountId` field nested inside `order` to scope the
+order to a specific sub-account. Nomba's own confirmed training
+example for `POST /checkout/order` does not include this field at
+all. That guessed field has been removed from
+`app/services/nomba_client.py` to match the confirmed shape exactly,
+rather than sending an unconfirmed extra field to a real payment API.
+If sub-account-level checkout scoping turns out to be needed for a
+real merchant flow, that's an open question to resolve against
+Nomba's dashboard/support before relying on it — not something to
+guess back in.
 
-Getting this backwards is a common and easy mistake (the field name
-`accountId` appears in both places, meaning two different things). This
-is documented explicitly in `app/services/nomba_client.py` next to each
-use, not left implicit.
+## 7b. Confirmed API details (from Nomba's official training material)
+
+The following were corrected after reviewing Nomba's own developer
+certification training material directly (not third-party pages),
+replacing earlier guesses that turned out to be wrong:
+
+- **Sandbox and production are separate hosts**, not the same host
+  with different credentials:
+  - Sandbox (all hackathon work): `https://sandbox.api.nomba.com/v1`
+  - Production (post-KYC only): `https://api.nomba.com/v1`
+  An earlier draft of `app/config.py` assumed a single shared host —
+  that was wrong and has been corrected.
+- **Amounts are in kobo**, as integers, everywhere in Nomba's API —
+  confirmed by their own example (`amount: 250000` for a ₦2,500.00
+  charge). This system stores and displays amounts in naira
+  throughout (matching the shared dashboard API contract), so the
+  kobo↔naira conversion happens at exactly one boundary —
+  `app/services/nomba_client.py`'s `_naira_to_kobo`/`_kobo_to_naira`
+  helpers — and nowhere else in the codebase needs to think about
+  kobo. An earlier draft sent a decimal-string naira amount directly
+  to Nomba's API, which would have been a real ~100x financial
+  correctness bug had it gone uncaught before a real transaction.
+- **Checkout response field is `checkoutUrl`**, not `checkoutLink` —
+  an earlier draft had this field name wrong, which would have caused
+  every recovery-checkout creation to fail with a "missing checkoutUrl"
+  error against the real API despite looking correct against no live
+  credentials to test with.
+- **A confirmed direct status endpoint exists**:
+  `GET /checkout/order/{orderReference}`. This replaced an earlier,
+  unconfirmed guess that queried a `/transactions/accounts` list
+  endpoint and filtered results client-side.
+- **Webhook payload shape**: Nomba's own confirmed example for a
+  `payment_success` event uses a flat structure —
+  `data.merchantTxRef`, `data.amount`, `data.currency` directly under
+  `data` — not the deeply nested `data.transaction.transactionId`
+  structure an earlier draft assumed. `services/signature.py`'s
+  `extract_event()` now tries the confirmed flat shape first, falling
+  back to the nested guess only if the flat fields aren't present,
+  since no confirmed shape exists yet specifically for a *failed*
+  payment event (only the success-side example was shown).
+- **Still genuinely open, not resolved by any source seen so far**:
+  whether Nomba's actual failed-payment webhook event is literally
+  named `PAYMENT_FAILED` — the "common event types" list in the
+  training material does not include a failure event at all (only
+  `payment_success`, `virtual_account.funded`, `transfer.success`,
+  `transfer.failed`, `mandate.debit_success`), while a different
+  endpoint's reference (event-log/replay filter values) does list
+  `PAYMENT_FAILED` as valid. The authoritative source — the literal
+  event name shown in Nomba's real dashboard when registering a
+  webhook and selecting which events to receive — should be checked
+  directly before the demo. Nomba's sandbox also ships real test
+  instruments for exactly this purpose: a documented "insufficient
+  funds" test card (`5060 6666 6666 6666 674`) that can trigger a
+  genuine sandbox failure and remove all doubt about the real payload
+  shape, rather than continuing to reason from documentation alone.
 
 ## 8. Rate limiting
 

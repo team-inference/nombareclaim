@@ -17,19 +17,42 @@ logger = logging.getLogger("nombareclaim.webhooks")
 router = APIRouter()
 
 # Event types that represent a failed/abandoned payment and should be
-# stored as a recoverable FailureEvent. Confirm the exact literal event
-# type strings Nomba sends against the dashboard's "available events"
-# list when registering the webhook (Phase J) — these are the
-# documented/most-likely names based on the public webhook intro page
-# (which confirms "payment_success" as the success-side name).
-FAILURE_EVENT_TYPES = {
-    "payment_failed",
-    "payment_failure",
-    "collection_failed",
-    "payment_abandoned",
-}
+# stored as a recoverable FailureEvent.
+#
+# IMPORTANT — genuinely unresolved, flagged rather than guessed past:
+# Nomba's own training material's "Common event types" table lists
+# only payment_success, virtual_account.funded, transfer.success,
+# transfer.failed, mandate.debit_success — it does NOT include a
+# payment-failed event at all. A separate, different endpoint's
+# reference (the event-log/replay API) lists PAYMENT_FAILED as a valid
+# eventType filter value, which is reasonable evidence a failure event
+# exists under that name, but it is not the same confirmation as
+# seeing it in the webhook "common events" list.
+#
+# ACTION BEFORE THE DEMO: when registering the webhook on Nomba's real
+# dashboard, there is an event-selection step ("select the events you
+# will like to be notified on") — the literal event name shown there
+# is the authoritative source, more reliable than either doc page.
+# Confirm it there and update FAILURE_EVENT_TYPES below if it differs
+# from "PAYMENT_FAILED". Alternatively, trigger a real sandbox failure
+# using the documented test card (5060 6666 6666 6666 674 — the
+# "insufficient funds" test card) and inspect what actually arrives.
+#
+# Matching is case-insensitive and checks both "event_type" and
+# "event" as the field name (see services/signature.py's extract_event)
+# since a training quiz payload used lowercase under "event" while
+# this endpoint's own docs use uppercase under (presumably) "event_type"
+# — neither source fully confirms the real production field name either.
+#
+# No dedicated "abandoned" event type appears in Nomba's documented
+# list at all — USER_ABANDONED classification currently can only be
+# reached via the AI-ambiguous-case path, not a dedicated event type.
+FAILURE_EVENT_TYPES = {"PAYMENT_FAILED"}
+SUCCESS_EVENT_TYPES = {"PAYMENT_SUCCESS"}
 
-SUCCESS_EVENT_TYPES = {"payment_success"}
+
+def _normalize_event_type(event_type: str) -> str:
+    return (event_type or "").strip().upper()
 
 
 def _run_classification(event_id: str):
@@ -64,14 +87,13 @@ def _run_classification(event_id: str):
         db.close()
 
 
-def _parse_amount(payload: dict) -> int:
-    raw = (
-        payload.get("data", {})
-        .get("transaction", {})
-        .get("amount")
-    )
+def _kobo_to_naira(amount_kobo) -> int:
+    """Nomba's confirmed convention: amounts are in kobo. This system
+    stores and displays naira throughout (matching the shared dashboard
+    API contract), so the conversion happens once, right here at
+    ingestion — nothing downstream needs to think about kobo."""
     try:
-        return int(round(float(raw)))
+        return round(float(amount_kobo) / 100)
     except (TypeError, ValueError):
         return 0
 
@@ -107,8 +129,13 @@ async def receive_nomba_webhook(
 
     verified = extract_event(payload)
 
+    # Store the raw event_type as Nomba actually sent it (for
+    # debugging/auditability), but compare using the normalized form
+    # since the real casing convention is still unconfirmed — see the
+    # note above FAILURE_EVENT_TYPES.
     event_type = verified.event_type
-    idempotency_key = f"{event_type}:{verified.transaction_id}:{verified.request_id}"
+    normalized_event_type = _normalize_event_type(event_type)
+    idempotency_key = f"{normalized_event_type}:{verified.transaction_id}:{verified.request_id}"
 
     # Idempotency at ingestion: duplicate delivery of the same event
     # returns 200 immediately without reprocessing.
@@ -120,7 +147,7 @@ async def receive_nomba_webhook(
     if existing is not None:
         return JSONResponse(status_code=200, content={"status": "duplicate_ignored"})
 
-    if event_type in SUCCESS_EVENT_TYPES:
+    if normalized_event_type in SUCCESS_EVENT_TYPES:
         # Look for a FailureEvent whose recovery checkout this success
         # event might correspond to, then verify server-side before
         # flipping status — never trust the webhook payload alone.
@@ -140,7 +167,7 @@ async def receive_nomba_webhook(
             await confirm_recovery_if_paid(candidate, db)
         return JSONResponse(status_code=200, content={"status": "ok"})
 
-    if event_type not in FAILURE_EVENT_TYPES:
+    if normalized_event_type not in FAILURE_EVENT_TYPES:
         # Not a failure/abandonment/success event we care about for
         # this build's scope — acknowledge and ignore, don't 4xx (a
         # 4xx here would trigger Nomba's retry/backoff policy for an
@@ -152,10 +179,10 @@ async def receive_nomba_webhook(
         request_id=verified.request_id,
         merchant_user_id=verified.merchant_user_id,
         wallet_id=verified.wallet_id,
-        event_type=event_type,
+        event_type=normalized_event_type,
         transaction_type=verified.transaction_type,
-        amount=_parse_amount(payload),
-        currency=payload.get("data", {}).get("transaction", {}).get("currency", "NGN"),
+        amount=_kobo_to_naira(verified.amount_kobo),
+        currency=verified.currency or "NGN",
         response_code=verified.response_code,
         raw_payload=json.dumps(payload),
         status=FailureStatus.NEW,

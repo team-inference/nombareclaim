@@ -50,12 +50,15 @@ class SignatureVerificationError(Exception):
 class ParsedEvent:
     event_type: str
     request_id: str
+    merchant_tx_ref: Optional[str]
     merchant_user_id: Optional[str]
     wallet_id: Optional[str]
     transaction_id: Optional[str]
     transaction_type: Optional[str]
     transaction_time: Optional[str]
     response_code: Optional[str]
+    amount_kobo: Optional[str]
+    currency: Optional[str]
 
 
 def _safe_get(d: dict, *path, default=None):
@@ -96,14 +99,43 @@ def extract_event(payload: dict) -> ParsedEvent:
     """Pulls the fields this system needs out of an already-verified,
     already-JSON-parsed payload. Kept separate from verify_signature()
     since verification must happen on raw bytes, while field extraction
-    naturally happens on the parsed dict afterwards."""
+    naturally happens on the parsed dict afterwards.
+
+    Two payload shapes are checked, since no fully-confirmed shape
+    exists yet for the specific event this project cares about most
+    (a failed payment):
+
+    - FLAT (confirmed by Nomba's own training material, shown for a
+      payment_success example): data.merchantTxRef, data.amount,
+      data.currency, directly under data.
+    - NESTED (an earlier, unconfirmed guess): data.transaction.*,
+      data.merchant.*.
+
+    The flat shape is tried first since it's the one actually
+    confirmed by official material; the nested shape is kept as a
+    fallback in case a failure-specific event turns out to carry
+    richer nested detail (e.g. responseCode) that the flat
+    payment_success example didn't need to show. event_type is read
+    from either "event_type" or "event" for the same reason — see
+    routes/webhooks.py's FAILURE_EVENT_TYPES comment for the full
+    context on what's confirmed versus still open.
+    """
+    flat_amount = _safe_get(payload, "data", "amount")
+    nested_amount = _safe_get(payload, "data", "transaction", "amount")
+
     return ParsedEvent(
-        event_type=payload.get("event_type", ""),
+        event_type=payload.get("event_type") or payload.get("event") or "",
         request_id=payload.get("requestId", ""),
+        merchant_tx_ref=_safe_get(payload, "data", "merchantTxRef"),
         merchant_user_id=_safe_get(payload, "data", "merchant", "userId"),
         wallet_id=_safe_get(payload, "data", "merchant", "walletId"),
-        transaction_id=_safe_get(payload, "data", "transaction", "transactionId"),
+        transaction_id=(
+            _safe_get(payload, "data", "merchantTxRef")
+            or _safe_get(payload, "data", "transaction", "transactionId")
+        ),
         transaction_type=_safe_get(payload, "data", "transaction", "type"),
         transaction_time=_safe_get(payload, "data", "transaction", "time"),
         response_code=_safe_get(payload, "data", "transaction", "responseCode"),
+        amount_kobo=flat_amount if flat_amount is not None else nested_amount,
+        currency=_safe_get(payload, "data", "currency") or _safe_get(payload, "data", "transaction", "currency"),
     )

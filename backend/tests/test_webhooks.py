@@ -1,13 +1,6 @@
 import hashlib
 import hmac
 import json
-import os
-
-# Set required env vars before importing the app so config picks them up.
-os.environ.setdefault("NOMBA_WEBHOOK_SIGNATURE_KEY", "test_webhook_secret_123")
-os.environ.setdefault("DATABASE_URL", "sqlite:///./test_nombareclaim.db")
-os.environ.setdefault("NOMBA_ACCOUNT_ID", "test-account")
-os.environ.setdefault("NOMBA_SUBACCOUNT_ID", "test-subaccount")
 
 from fastapi.testclient import TestClient
 
@@ -30,7 +23,7 @@ PAYLOAD = {
             "type": "vact_transfer",
             "time": "2026-06-30T10:00:00Z",
             "responseCode": "51",
-            "amount": "15000.00",
+            "amount": 1500000,  # kobo -> ₦15,000 (nested/legacy shape, kept as a fallback-path test)
             "currency": "NGN",
         },
     },
@@ -75,6 +68,11 @@ def test_valid_signed_webhook_is_accepted_and_stored():
     assert body["status"] == "received"
     assert "id" in body
 
+    # Confirm the nested/legacy shape also converts kobo -> naira
+    # correctly through the fallback path in extract_event().
+    detail = client.get(f"/api/failures/{body['id']}")
+    assert detail.json()["amount"] == 15000
+
 
 def test_duplicate_delivery_is_not_reprocessed():
     raw_body = json.dumps(PAYLOAD).encode("utf-8")
@@ -99,3 +97,58 @@ def test_duplicate_delivery_is_not_reprocessed():
         if f["nomba_transaction_id"] == "txn-webhook-test-1"
     ]
     assert len(matches) == 1
+
+
+def test_uppercase_event_type_is_accepted_same_as_lowercase():
+    # Nomba's real API docs use uppercase event type values
+    # (PAYMENT_FAILED, PAYMENT_SUCCESS) while an unrelated training
+    # quiz payload used lowercase under a different field name. This
+    # system must accept either — a real webhook arriving in whichever
+    # convention Nomba actually uses in practice must not be silently
+    # dropped as "ignored".
+    uppercase_payload = {
+        "event_type": "PAYMENT_FAILED",
+        "requestId": "req-webhook-test-uppercase",
+        "data": {
+            "merchant": {"userId": "user-2", "walletId": "wallet-2"},
+            "transaction": {
+                "transactionId": "txn-webhook-test-uppercase",
+                "type": "vact_transfer",
+                "time": "2026-06-30T10:00:00Z",
+                "responseCode": "05",
+                "amount": 700000,  # kobo -> ₦7,000
+                "currency": "NGN",
+            },
+        },
+    }
+    raw_body = json.dumps(uppercase_payload).encode("utf-8")
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "received"
+
+
+def test_confirmed_flat_payload_shape_converts_kobo_to_naira():
+    # This is the CONFIRMED shape from Nomba's own training material
+    # (data.merchantTxRef, data.amount, data.currency directly under
+    # data — not nested under data.transaction.*). Amount is in kobo:
+    # 250000 kobo must become ₦2,500 stored, matching the shared
+    # dashboard API contract which displays naira throughout.
+    flat_payload = {
+        "event_type": "PAYMENT_FAILED",
+        "requestId": "req-flat-shape-test",
+        "data": {
+            "merchantTxRef": "ord_flat_test_001",
+            "amount": 250000,  # kobo -> should become 2500 naira
+            "currency": "NGN",
+        },
+    }
+    raw_body = json.dumps(flat_payload).encode("utf-8")
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    assert resp.status_code == 200
+    event_id = resp.json()["id"]
+
+    detail = client.get(f"/api/failures/{event_id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["amount"] == 2500
+    assert body["nomba_transaction_id"] == "ord_flat_test_001"

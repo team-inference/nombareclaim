@@ -18,14 +18,17 @@ class Settings:
     NOMBA_SUBACCOUNT_ID: str = os.getenv("NOMBA_SUBACCOUNT_ID", "")
 
     # --- Nomba API auth ---
-    # Nomba does not use separate sandbox/live hostnames — the same
-    # https://api.nomba.com/v1 base URL is used for both. Which mode
-    # you are in is determined entirely by which client_id / private_key
-    # pair you put in these two env vars. Use the TEST pair for all
-    # development, the July 3 checkpoint, and the demo.
+    # CONFIRMED against Nomba's official training material: sandbox and
+    # production are SEPARATE HOSTS, not the same host with different
+    # credentials (an earlier version of this file assumed the latter —
+    # that was wrong).
+    #   Sandbox (all hackathon work):  https://sandbox.api.nomba.com/v1
+    #   Production (post-KYC only):    https://api.nomba.com/v1
+    # Use the TEST client_id/private_key pair together with the sandbox
+    # host for all development, the July 3 checkpoint, and the demo.
     NOMBA_CLIENT_ID: str = os.getenv("NOMBA_CLIENT_ID", "")
     NOMBA_PRIVATE_KEY: str = os.getenv("NOMBA_PRIVATE_KEY", "")
-    NOMBA_API_BASE_URL: str = os.getenv("NOMBA_API_BASE_URL", "https://api.nomba.com/v1")
+    NOMBA_API_BASE_URL: str = os.getenv("NOMBA_API_BASE_URL", "https://sandbox.api.nomba.com/v1")
 
     # --- Webhook verification ---
     # CONFIRMED against Nomba's official training documentation

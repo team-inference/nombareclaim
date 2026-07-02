@@ -75,7 +75,15 @@ class ClassificationResult:
 def _deterministic_classification(
     response_code: Optional[str], transaction_type: Optional[str], event_type: str
 ) -> Optional[Classification]:
-    if event_type == "payment_abandoned" or (transaction_type or "").lower() == "abandoned":
+    # No dedicated "abandoned" event type is confirmed to exist in
+    # Nomba's documented event list (PAYMENT_SUCCESS, PAYMENT_FAILED,
+    # PAYOUT_*, ORDER_SUCCESS, PAYMENT_REVERSAL, PAYOUT_REFUND) — this
+    # check is kept as a defensive no-op in case one turns out to exist
+    # under a name not yet seen, but USER_ABANDONED is realistically
+    # only reachable via the AI-ambiguous-case path below for now.
+    # Case-insensitive since the real casing convention Nomba uses is
+    # still unconfirmed (see routes/webhooks.py FAILURE_EVENT_TYPES).
+    if (event_type or "").upper() == "PAYMENT_ABANDONED" or (transaction_type or "").lower() == "abandoned":
         return Classification.USER_ABANDONED
     if response_code and response_code in RESPONSE_CODE_MAP:
         return RESPONSE_CODE_MAP[response_code]

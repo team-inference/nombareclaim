@@ -46,16 +46,32 @@ async def confirm_recovery_if_paid(event: FailureEvent, db: Session) -> FailureE
     """
     Server-side verification: called when a payment_success webhook
     arrives referencing a recovery_checkout_order_id we know about.
-    Cross-checks against Nomba's transaction API rather than trusting
-    the webhook payload alone, per the security note's core principle.
+    Cross-checks against Nomba's own checkout order status endpoint
+    rather than trusting the webhook payload alone, per the security
+    note's core principle — a forged or replayed webhook cannot move
+    this system's state on its own, only trigger a lookup.
+
+    The exact field name Nomba's order-status response uses for
+    status isn't confirmed by the training material seen so far (only
+    checkout creation's response shape — checkoutUrl — was confirmed).
+    This checks several plausible field names/values defensively
+    rather than betting on one; confirm the real shape against a live
+    sandbox order lookup before the demo and simplify this once known.
     """
     if not event.recovery_checkout_order_id:
         return event
 
-    tx = await nomba_client.get_transaction_status(event.recovery_checkout_order_id)
-    status = (tx.get("status") or "").upper()
+    order = await nomba_client.get_checkout_order_status(event.recovery_checkout_order_id)
 
-    if status in ("SUCCESS", "SUCCESSFUL", "PAYMENT_SUCCESS", "COMPLETED"):
+    status_value = (
+        order.get("status")
+        or order.get("orderStatus")
+        or order.get("paymentStatus")
+        or ""
+    )
+    status_value = str(status_value).upper()
+
+    if status_value in ("SUCCESS", "SUCCESSFUL", "PAYMENT_SUCCESS", "COMPLETED", "PAID"):
         event.status = FailureStatus.RECOVERED
         event.recovered_at = datetime.now(timezone.utc)
         db.add(event)
