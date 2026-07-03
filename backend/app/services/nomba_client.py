@@ -111,7 +111,7 @@ async def _auth_headers() -> dict:
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "accountId": settings.NOMBA_ACCOUNT_ID,
+        "accountId": settings.NOMBA_SUBACCOUNT_ID,
     }
 
 

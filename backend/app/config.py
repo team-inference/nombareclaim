@@ -59,6 +59,7 @@ class Settings:
         ).split(",")
         if o.strip()
     ]
+    FRONTEND_BASE_URL: str = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
 
     # Manual-trigger recovery score threshold. The score is advisory,
     # not a hard gate, for the manual dashboard trigger path — see

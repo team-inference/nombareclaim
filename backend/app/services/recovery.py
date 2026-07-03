@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
+from app.config import settings
 
 from app.models import FailureEvent, FailureStatus
 from app.services import nomba_client
@@ -30,7 +31,7 @@ async def trigger_recovery(event_id: str, db: Session, callback_base_url: str) -
         currency=event.currency,
         customer_reference=f"reclaim-{event.id}",
         description=f"Recovery checkout for failed transaction {event.nomba_transaction_id}",
-        callback_url=f"{callback_base_url}/webhooks/nomba",
+        callback_url=f"{settings.FRONTEND_BASE_URL}/payment/return",
     )
 
     event.recovery_checkout_order_id = result["order_reference"]
