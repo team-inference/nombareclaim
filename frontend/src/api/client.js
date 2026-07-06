@@ -41,6 +41,7 @@ async function request(path, options = {}) {
 
 export const apiClient = {
   useMocks: USE_MOCKS,
+  baseUrl: API_BASE_URL,
   get: (path) => request(path, { method: 'GET' }),
   post: (path, body) =>
     request(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),

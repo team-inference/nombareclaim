@@ -13,7 +13,11 @@ corresponding file.
 ```
 Nomba (webhook) -> POST /webhooks/nomba -> verify signature -> store FailureEvent
                                                               -> background: classify (rules + Gemini/Groq)
-Merchant dashboard -> GET /api/summary, /api/failures -> read from FailureEvent table
+                                                              -> background: maybe_auto_recover (opt-in, score-gated)
+                                                                 -> Nomba Checkout API -> recovery email (SMTP)
+                                                                 -> schedules next_retry_at (payday / backoff)
+Background retry sweep (opt-in) -> due FailureEvents -> fresh checkout link -> recovery email -> reschedule
+Merchant dashboard -> GET /api/summary, /api/summary/trend, /api/analytics/breakdown, /api/failures, /api/export
                     -> POST /api/failures/{id}/trigger-recovery -> Nomba Checkout API -> recovery link
 Nomba (webhook, payment_success on the recovery checkout) -> server-side transaction lookup -> mark RECOVERED
 ```
@@ -146,23 +150,33 @@ only trigger a lookup.
 
 ## 7. accountId / sub-account scoping
 
-Every authenticated call to Nomba's API carries the **parent
-`accountId`** in the request header (`accountId: <parent>`) — this is
-what Nomba's auth and resource endpoints expect on every call,
-including the token-issue call itself.
+Per Nomba's own credentials brief for this hackathon ("Authenticate
+with the parent Account ID in the `accountId` header, then scope your
+calls to your sub-account ID."), this system uses two different
+`accountId` values depending on the call:
 
-**Correction from an earlier draft of this document**: this system
-previously assumed the checkout order request body also needed a
-sub-account `accountId` field nested inside `order` to scope the
-order to a specific sub-account. Nomba's own confirmed training
-example for `POST /checkout/order` does not include this field at
-all. That guessed field has been removed from
-`app/services/nomba_client.py` to match the confirmed shape exactly,
-rather than sending an unconfirmed extra field to a real payment API.
-If sub-account-level checkout scoping turns out to be needed for a
-real merchant flow, that's an open question to resolve against
-Nomba's dashboard/support before relying on it — not something to
-guess back in.
+- **Token issuance** (`_get_access_token` in `app/services/nomba_client.py`):
+  the **parent** `accountId` (`NOMBA_ACCOUNT_ID`).
+- **Every call made after auth** — checkout order creation, order
+  status lookup (`_auth_headers`): the **sub-account** `accountId`
+  (`NOMBA_SUBACCOUNT_ID`).
+
+**Correction from an earlier draft**: `NOMBA_SUBACCOUNT_ID` was defined
+in `config.py` from early on but was never actually referenced
+anywhere — every post-auth call was sending the parent account ID
+instead, which directly contradicted the credentials brief above. This
+was caught and fixed by wiring `_auth_headers()` to use
+`NOMBA_SUBACCOUNT_ID`, leaving token issuance on the parent ID exactly
+as specified.
+
+Still genuinely open: whether the checkout order **request body**
+(not just the header) also needs an explicit sub-account field nested
+inside `order` — the confirmed training example's body doesn't include
+one, and the credentials brief only speaks to the header. This client
+does not add one to the body, matching the confirmed training example,
+while scoping the header correctly per the brief. Worth confirming
+against a real sandbox transaction if checkout orders ever appear
+under the wrong sub-account in Nomba's own reporting.
 
 ## 7b. Confirmed API details (from Nomba's official training material)
 
@@ -267,13 +281,117 @@ implied to be production-grade.
   template instead of AI-written, but the failure event is still
   captured, classified by rules, and shown on the dashboard.
 
-## 11. Honest scope statement
+## 11. Automated recovery (email) — opt-in, hard-gated
+
+Beyond the manual "trigger recovery" dashboard button, this build adds
+a fully-automatic path: `app/services/recovery.py::maybe_auto_recover`,
+called from the classification background task
+(`app/routes/webhooks.py::_run_classification`) immediately after a
+new failure event is classified.
+
+**This is off by default** (`RECOVERY_AUTOMATION_ENABLED=false`) — a
+fresh deployment should never silently email a real customer until
+someone deliberately turns it on. When enabled, it only fires when
+*all* of the following hold:
+
+1. The webhook payload actually contained a customer email
+   (`customer_email` on `FailureEvent`) — opportunistically extracted
+   in `services/signature.py` from several possible field names/paths,
+   since no confirmed Nomba example payload includes this field at
+   all. Absent it, automation simply never fires for that event —
+   recovery still works, just manually via the dashboard link.
+2. `recovery_score` clears `AUTO_RECOVERY_MIN_SCORE` (default 40) —
+   unlike the manual dashboard button, which has no score gate at all
+   and lets a merchant/judge override the AI's confidence.
+3. The event hasn't already had recovery triggered.
+
+When it fires: a checkout link is generated exactly like the manual
+path, then a plain-text email is sent via `services/notifications.py`
+(stdlib `smtplib`, works with a Gmail app password or any SMTP relay —
+no new dependency added). If SMTP isn't configured
+(`SMTP_HOST`/`SMTP_USERNAME`/`SMTP_PASSWORD`/`SMTP_FROM_EMAIL` all
+blank by default), `send_recovery_email` logs and returns `False`
+rather than raising — the rest of the pipeline (classification,
+checkout link generation, dashboard) keeps working with automation
+just never actually sending anything.
+
+## 12. Payday retry — automatic follow-up scheduling
+
+If the first automated email is sent, `services/scheduling.py`
+computes `next_retry_at` for a follow-up attempt:
+
+- **`INSUFFICIENT_FUNDS`**: scheduled around Nigeria's common
+  salary-payment window (`PAYDAY_RETRY_DAYS`, default the 25th through
+  end of month plus the 1st) rather than a short fixed delay — an
+  empty wallet is far more likely to succeed once the customer has
+  actually been paid than it is three hours later.
+- **Every other classification**: a short fixed backoff
+  (`RETRY_BACKOFF_HOURS`, default 3h / 24h / 72h) — these failures
+  (card declined, network timeout, abandoned) aren't tied to a
+  predictable future event the way an empty wallet is.
+- Both stop after `MAX_AUTO_RETRIES` (default 3) — a customer is never
+  emailed indefinitely.
+
+A background asyncio loop (`services/scheduler.py::retry_sweep_loop`),
+started at app startup only when `RECOVERY_AUTOMATION_ENABLED=true`,
+wakes every `RETRY_SWEEP_INTERVAL_SECONDS` (default 300s) and hands
+every due `FailureEvent` to `services/recovery.py::send_retry_recovery`,
+which generates a **fresh** checkout order (the first one may well
+have expired) with a unique order reference per attempt
+(`reclaim-{id}-r{n}`), re-sends the email, and reschedules the next
+attempt if any remain.
+
+This is deliberately a single in-process asyncio loop, not
+APScheduler/Celery/a separate cron service — appropriate for a
+single-instance Railway deployment with one worker process. **If this
+ever runs across multiple instances, it needs to move to a real job
+queue so two workers can't double-send the same retry** — stated here
+rather than silently assumed away.
+
+## 13. Analytics & export
+
+Two read-only additions, both consistent with the existing
+public/unauthenticated dashboard API (see section 9 on data handling —
+no customer PII in either):
+
+- `GET /api/analytics/breakdown` — recovery performance grouped by
+  AI-classified failure reason (count, amount at risk, recovered
+  count/amount, recovery rate per classification). Powers the
+  dashboard's "Recovery by Failure Reason" chart.
+- `GET /api/export` — CSV export of every captured failure event
+  (transaction id, amount, classification, status, `has_contact`
+  boolean, retry count, timestamps) for merchants who want this in
+  their own spreadsheet/BI tool.
+
+Also fixed in this pass: `GET /api/summary/trend` **did not previously
+exist** — the frontend's `getRecoveryTrend()` silently fell back to
+fixture data on a 404, which is why the dashboard's 7-day trend chart
+kept showing a plausible-looking curve even on a fresh deployment with
+zero real failure events everywhere else. It's now a real endpoint
+returning cumulative recovery rate per day, computed from actual
+`FailureEvent` rows.
+
+## 14. Configurable webhook event type names
+
+`NOMBA_FAILURE_EVENT_TYPES` / `NOMBA_SUCCESS_EVENT_TYPES` (both env
+vars, comma-separated, matched case-insensitively) replace what were
+previously hardcoded constants in `routes/webhooks.py`. This exists
+specifically because the real event name for a failed payment is
+still not confirmed by any doc source seen so far (see section 7b) —
+if it turns out to differ from `PAYMENT_FAILED` once confirmed against
+Nomba's dashboard or a live sandbox test, that's now a one-line env var
+change on Railway, not a code change and redeploy.
+
+## 15. Honest scope statement
 
 What this build does **not** do, stated upfront rather than discovered
-by a judge: no fully-automatic trigger-on-classification path exists
-(triggering recovery is currently a deliberate human action from the
-dashboard, gated only by simple rate limiting); no "payday timed retry"
-logic is implemented (flagged in the team's own strategy notes as the
-riskiest line in the original pitch, and intentionally cut rather than
-faked); dashboard updates after a recovery completes via manual refresh,
-not push/websockets. None of this is hidden in the demo.
+by a judge: dashboard updates after a recovery completes via manual
+refresh, not push/websockets; the automated retry sweep is a
+single-instance in-process loop, not a distributed job queue (see
+section 12); SMS/WhatsApp recovery channels are not implemented, only
+email, since only `customer_email` is opportunistically extracted from
+the webhook payload today, not phone number, even though the
+`customer_phone` field exists on the model for a future channel; and
+the checkout order body's sub-account scoping (as opposed to the
+header, which is fixed) remains genuinely unconfirmed (see section 7).
+None of this is hidden in the demo.

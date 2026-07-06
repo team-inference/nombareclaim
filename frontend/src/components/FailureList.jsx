@@ -58,6 +58,7 @@ export default function FailureList({ failures, loading, selectedId, onSelect, s
                 <th className="px-5 py-3 font-medium">Reason</th>
                 <th className="px-5 py-3 font-medium">Score</th>
                 <th className="px-5 py-3 font-medium">Status</th>
+                <th className="px-5 py-3 font-medium">Auto-Recovery</th>
                 <th className="px-5 py-3 font-medium">Date</th>
               </tr>
             </thead>
@@ -79,6 +80,31 @@ export default function FailureList({ failures, loading, selectedId, onSelect, s
                   </td>
                   <td className="px-5 py-3.5">
                     <StatusBadge status={f.status} />
+                  </td>
+                  <td className="px-5 py-3.5">
+                    {f.has_contact ? (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs text-ink-muted"
+                        title={
+                          f.next_retry_at
+                            ? `Next automatic retry: ${formatDate(f.next_retry_at)}`
+                            : 'Customer email captured — eligible for automatic recovery'
+                        }
+                      >
+                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                          <path
+                            d="M2 4h12v8H2V4zm0 0l6 4.5L14 4"
+                            stroke="currentColor"
+                            strokeWidth="1.3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                        {f.retry_count > 0 ? `Sent ×${f.retry_count + 1}` : 'Sent'}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-ink-faint">No contact</span>
+                    )}
                   </td>
                   <td className="px-5 py-3.5 text-ink-faint">{formatDate(f.created_at)}</td>
                 </tr>

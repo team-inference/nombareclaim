@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import { mockSummary, mockFailures, mockFailureDetail, mockTrend } from '../mocks/mockData'
+import { mockSummary, mockFailures, mockFailureDetail, mockTrend, mockBreakdown } from '../mocks/mockData'
 
 // Small helper to fake realistic network latency in mock mode, so
 // loading states are actually visible and testable during dev.
@@ -69,11 +69,10 @@ export async function triggerRecovery(id) {
 }
 
 export async function getRecoveryTrend() {
-  // Not part of the shared API contract — the chart is explicitly a
-  // nice-to-have per Daniel's spec. Falls back to mock trend data even
-  // in non-mock mode until/unless a real trend endpoint exists, so the
-  // chart never breaks the rest of the dashboard if the backend hasn't
-  // implemented it.
+  // As of this build, /api/summary/trend is a real backend endpoint
+  // (cumulative recovery rate over the last N days) — the mock
+  // fallback below now only triggers on an actual network/API error,
+  // not silently by design as it did previously.
   if (apiClient.useMocks) {
     await wait(200)
     return mockTrend
@@ -83,4 +82,16 @@ export async function getRecoveryTrend() {
   } catch {
     return mockTrend
   }
+}
+
+export async function getClassificationBreakdown() {
+  if (apiClient.useMocks) {
+    await wait(220)
+    return mockBreakdown
+  }
+  return apiClient.get('/api/analytics/breakdown')
+}
+
+export function getExportUrl() {
+  return `${apiClient.baseUrl}/api/export`
 }

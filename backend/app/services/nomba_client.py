@@ -28,11 +28,23 @@ Confirmed shapes:
   minutes (this client refreshes early, well before that).
 
 - Checkout order creation: POST {base}/checkout/order, headers
-  Authorization (bearer token) + accountId (parent) + Content-Type.
-  Body: {"order": {orderReference, amount (INTEGER KOBO), currency,
+  Authorization (bearer token) + accountId + Content-Type. Body:
+  {"order": {orderReference, amount (INTEGER KOBO), currency,
   callbackUrl, customerId, customerEmail}}. Response:
   `data.checkoutUrl` (NOT `checkoutLink` — an earlier version of this
   file had this field name wrong).
+
+  **accountId scoping, per Nomba's own credentials brief for this
+  hackathon** ("Authenticate with the parent Account ID in the
+  accountId header, then scope your calls to your sub-account ID."):
+  token issuance (_get_access_token) uses the PARENT accountId
+  (NOMBA_ACCOUNT_ID); every call made AFTER auth — checkout order
+  creation, status lookup — uses the SUB-ACCOUNT accountId
+  (NOMBA_SUBACCOUNT_ID) via _auth_headers(). An earlier version of
+  this file sent the parent accountId on every call including
+  post-auth resource calls, which NOMBA_SUBACCOUNT_ID (defined in
+  config.py) was never actually wired into — fixed to match the
+  credentials brief exactly.
 
 - Checkout order status lookup: GET {base}/checkout/order/{orderReference}
   — a direct, confirmed endpoint. This replaces an earlier guessed
@@ -41,13 +53,15 @@ Confirmed shapes:
   direct lookup is confirmed to exist.
 
 Still open / not confirmed by any source seen so far, and worth
-checking against a real sandbox test before the demo (see the
-`docs/checkout/order` sub-account note below, and SECURITY.md):
-- Whether checkout order creation needs an explicit sub-account
-  `accountId` inside the order body at all — the confirmed training
-  example does not include one. This client currently does NOT send
-  one, matching the confirmed example exactly, rather than the earlier
-  guessed version which invented one.
+checking against a real sandbox test before the demo (see
+SECURITY.md):
+- Whether the checkout order BODY (not just the header) needs an
+  explicit sub-account field nested inside `order` as well — the
+  confirmed training example's request body doesn't include one, and
+  the credentials brief only specifies the *header*. This client
+  currently does NOT add one to the body, matching the confirmed
+  training example exactly, while still scoping the header correctly
+  per the credentials brief above.
 """
 import time
 from typing import Optional

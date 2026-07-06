@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from 'react'
 import SummaryCards from '../components/SummaryCards'
 import RecoveryRateChart from '../components/RecoveryRateChart'
+import ClassificationBreakdownChart from '../components/ClassificationBreakdownChart'
 import FailureList from '../components/FailureList'
 import FailureDetail from '../components/FailureDetail'
-import { getSummary, getFailures, getRecoveryTrend } from '../api/failures'
+import { getSummary, getFailures, getRecoveryTrend, getClassificationBreakdown, getExportUrl } from '../api/failures'
 
 export default function Dashboard() {
   const [summary, setSummary] = useState(null)
   const [summaryLoading, setSummaryLoading] = useState(true)
   const [trend, setTrend] = useState(null)
   const [trendLoading, setTrendLoading] = useState(true)
+  const [breakdown, setBreakdown] = useState(null)
+  const [breakdownLoading, setBreakdownLoading] = useState(true)
 
   const [failures, setFailures] = useState([])
   const [failuresLoading, setFailuresLoading] = useState(true)
@@ -33,6 +36,11 @@ export default function Dashboard() {
     getRecoveryTrend()
       .then(setTrend)
       .finally(() => setTrendLoading(false))
+
+    setBreakdownLoading(true)
+    getClassificationBreakdown()
+      .then(setBreakdown)
+      .finally(() => setBreakdownLoading(false))
 
     setFailuresLoading(true)
     getFailures({ status: statusFilter || undefined })
@@ -71,26 +79,46 @@ export default function Dashboard() {
 
       <div className="flex items-center justify-between">
         <h1 className="font-display text-xl font-semibold text-ink">Dashboard</h1>
-        <button
-          onClick={handleRefresh}
-          className="flex items-center gap-1.5 rounded-md border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-muted hover:bg-paper"
-        >
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path
-              d="M13.5 8a5.5 5.5 0 11-1.6-3.9M13.5 3v3.5H10"
-              stroke="currentColor"
-              strokeWidth="1.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <a
+            href={getExportUrl()}
+            className="flex items-center gap-1.5 rounded-md border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-muted hover:bg-paper"
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M8 2v8m0 0l3-3m-3 3L5 7M3 12h10"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            Export CSV
+          </a>
+          <button
+            onClick={handleRefresh}
+            className="flex items-center gap-1.5 rounded-md border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-muted hover:bg-paper"
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M13.5 8a5.5 5.5 0 11-1.6-3.9M13.5 3v3.5H10"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            Refresh
+          </button>
+        </div>
       </div>
 
       <SummaryCards summary={summary} loading={summaryLoading} />
 
-      <RecoveryRateChart data={trend} loading={trendLoading} />
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <RecoveryRateChart data={trend} loading={trendLoading} />
+        <ClassificationBreakdownChart data={breakdown} loading={breakdownLoading} />
+      </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="lg:col-span-2">

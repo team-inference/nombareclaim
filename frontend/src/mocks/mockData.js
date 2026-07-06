@@ -26,6 +26,9 @@ export const mockFailures = [
       "Hi! Your ₦65,000 payment didn't complete due to a network hiccup on our end, not yours. Please try again with this fresh link.",
     created_at: '2026-06-28T09:14:00Z',
     recovered_at: null,
+    has_contact: true,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0002',
@@ -39,6 +42,9 @@ export const mockFailures = [
       "Hi! Your ₦18,500 payment didn't go through, looks like a funds issue. Here's a fresh link to complete it whenever you're ready.",
     created_at: '2026-06-28T11:02:00Z',
     recovered_at: null,
+    has_contact: true,
+    retry_count: 1,
+    next_retry_at: '2026-07-08T08:00:00Z',
   },
   {
     id: 'f1a2b3c4-0003',
@@ -52,6 +58,9 @@ export const mockFailures = [
       "Hi! You started a ₦9,200 payment but didn't finish, still interested? Here's your checkout link.",
     created_at: '2026-06-27T16:45:00Z',
     recovered_at: null,
+    has_contact: false,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0004',
@@ -65,6 +74,9 @@ export const mockFailures = [
       'Hi! Your card declined the ₦124,000 payment. You can try a different card or bank transfer here.',
     created_at: '2026-06-27T08:30:00Z',
     recovered_at: null,
+    has_contact: true,
+    retry_count: 0,
+    next_retry_at: '2026-07-06T15:00:00Z',
   },
   {
     id: 'f1a2b3c4-0005',
@@ -78,6 +90,9 @@ export const mockFailures = [
       "Hi! Your ₦45,000 payment didn't complete due to a network hiccup on our end, not yours. Please try again with this fresh link.",
     created_at: '2026-06-25T13:20:00Z',
     recovered_at: '2026-06-25T14:05:00Z',
+    has_contact: true,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0006',
@@ -90,6 +105,9 @@ export const mockFailures = [
     recovery_message: null,
     created_at: '2026-06-29T07:55:00Z',
     recovered_at: null,
+    has_contact: false,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0007',
@@ -103,6 +121,9 @@ export const mockFailures = [
       "Hi! Your ₦33,000 payment didn't go through, looks like a funds issue. Here's a fresh link to complete it whenever you're ready.",
     created_at: '2026-06-20T10:10:00Z',
     recovered_at: null,
+    has_contact: true,
+    retry_count: 3,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0008',
@@ -116,6 +137,9 @@ export const mockFailures = [
       'Hi! Your card declined the ₦250,000 payment. You can try a different card or bank transfer here.',
     created_at: '2026-06-26T19:40:00Z',
     recovered_at: null,
+    has_contact: false,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0009',
@@ -128,6 +152,9 @@ export const mockFailures = [
     recovery_message: null,
     created_at: '2026-06-29T15:18:00Z',
     recovered_at: null,
+    has_contact: false,
+    retry_count: 0,
+    next_retry_at: null,
   },
   {
     id: 'f1a2b3c4-0010',
@@ -141,6 +168,9 @@ export const mockFailures = [
       "Hi! Your ₦28,000 payment didn't complete due to a network hiccup on our end, not yours. Please try again with this fresh link.",
     created_at: '2026-06-22T06:40:00Z',
     recovered_at: '2026-06-22T07:02:00Z',
+    has_contact: true,
+    retry_count: 0,
+    next_retry_at: null,
   },
 ]
 
@@ -166,3 +196,15 @@ export const mockTrend = [
   { date: 'Jun 28', recovery_rate: 31.5 },
   { date: 'Jun 29', recovery_rate: 34.2 },
 ]
+
+// Recovery performance by AI-classified failure reason — feeds
+// ClassificationBreakdownChart.
+export const mockBreakdown = {
+  items: [
+    { classification: 'NETWORK_TIMEOUT', count: 3, total_amount: 138000, recovered_count: 2, recovered_amount: 93000, recovery_rate: 66.7 },
+    { classification: 'INSUFFICIENT_FUNDS', count: 2, total_amount: 51500, recovered_count: 0, recovered_amount: 0, recovery_rate: 0.0 },
+    { classification: 'CARD_DECLINED', count: 2, total_amount: 374000, recovered_count: 0, recovered_amount: 0, recovery_rate: 0.0 },
+    { classification: 'USER_ABANDONED', count: 2, total_amount: 21200, recovered_count: 0, recovered_amount: 0, recovery_rate: 0.0 },
+    { classification: 'OTHER', count: 1, total_amount: 7600, recovered_count: 0, recovered_amount: 0, recovery_rate: 0.0 },
+  ],
+}

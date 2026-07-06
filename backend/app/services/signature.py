@@ -59,6 +59,9 @@ class ParsedEvent:
     response_code: Optional[str]
     amount_kobo: Optional[str]
     currency: Optional[str]
+    customer_email: Optional[str]
+    customer_phone: Optional[str]
+    customer_name: Optional[str]
 
 
 def _safe_get(d: dict, *path, default=None):
@@ -138,4 +141,24 @@ def extract_event(payload: dict) -> ParsedEvent:
         response_code=_safe_get(payload, "data", "transaction", "responseCode"),
         amount_kobo=flat_amount if flat_amount is not None else nested_amount,
         currency=_safe_get(payload, "data", "currency") or _safe_get(payload, "data", "transaction", "currency"),
+        # Not present in Nomba's confirmed payment_success example, and
+        # not guaranteed to exist on a failure event either — checked
+        # defensively across every plausible field name/nesting so the
+        # automated recovery-notification pipeline can use it when it
+        # IS there, without assuming it always will be.
+        customer_email=(
+            _safe_get(payload, "data", "customerEmail")
+            or _safe_get(payload, "data", "customer", "email")
+            or _safe_get(payload, "data", "email")
+        ),
+        customer_phone=(
+            _safe_get(payload, "data", "customerPhone")
+            or _safe_get(payload, "data", "customer", "phone")
+            or _safe_get(payload, "data", "customer", "phoneNumber")
+            or _safe_get(payload, "data", "phoneNumber")
+        ),
+        customer_name=(
+            _safe_get(payload, "data", "customerName")
+            or _safe_get(payload, "data", "customer", "name")
+        ),
     )

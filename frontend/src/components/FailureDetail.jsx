@@ -122,6 +122,30 @@ export default function FailureDetail({ eventId, onClose, onRecovered }) {
               <p className="mt-1 text-sm text-ink-muted">{formatDateTime(detail.created_at)}</p>
             </div>
 
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-ink-faint">
+                Automated Recovery
+              </p>
+              {detail.has_contact ? (
+                <div className="mt-1.5 space-y-1 rounded-md bg-paper p-3 text-sm text-ink-muted">
+                  <p>
+                    Customer contact captured — eligible for automatic email recovery
+                    {detail.retry_count > 0 ? ` (${detail.retry_count} follow-up${detail.retry_count > 1 ? 's' : ''} sent so far)` : ''}.
+                  </p>
+                  {detail.next_retry_at && (
+                    <p className="text-ink-faint">
+                      Next automatic retry: {formatDateTime(detail.next_retry_at)}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-1.5 rounded-md bg-paper p-3 text-sm text-ink-faint">
+                  No customer contact was captured on this webhook event — recovery here is
+                  manual-only via the checkout link below.
+                </p>
+              )}
+            </div>
+
             {error && (
               <p className="rounded-md bg-status-expired-bg px-3 py-2 text-sm text-status-expired-fg">
                 {error}

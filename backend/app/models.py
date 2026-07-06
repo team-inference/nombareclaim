@@ -64,6 +64,16 @@ class FailureEvent(Base):
     currency = Column(String, nullable=False, default="NGN")
     response_code = Column(String, nullable=True)
 
+    # Opportunistically captured from the webhook payload if present —
+    # Nomba's confirmed payment_success example payload doesn't include
+    # these, so a given failure event may well have none of them. When
+    # present, they're what makes the automated recovery email/SMS
+    # pipeline possible for that event; when absent, recovery still
+    # works, just manually via the dashboard's checkout link.
+    customer_email = Column(String, nullable=True)
+    customer_phone = Column(String, nullable=True)
+    customer_name = Column(String, nullable=True)
+
     raw_payload = Column(Text, nullable=False)
 
     classification = Column(SAEnum(Classification), nullable=True)
@@ -74,6 +84,13 @@ class FailureEvent(Base):
 
     recovery_checkout_order_id = Column(String, nullable=True)
     recovery_checkout_url = Column(String, nullable=True)
+
+    # Automated follow-up scheduling ("payday retry" etc). See
+    # services/scheduling.py for how next_retry_at is computed and
+    # services/scheduler.py for the background sweep that acts on it.
+    retry_count = Column(Integer, nullable=False, default=0)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    last_notified_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
