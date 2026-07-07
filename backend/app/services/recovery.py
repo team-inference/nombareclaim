@@ -7,6 +7,7 @@ from app.config import settings
 from app.models import FailureEvent, FailureStatus
 from app.services import nomba_client, scheduling
 from app.services.notifications import send_recovery_email
+from app.services.signature import _safe_get
 
 logger = logging.getLogger("nombareclaim.recovery")
 
@@ -172,27 +173,55 @@ async def confirm_recovery_if_paid(event: FailureEvent, db: Session) -> FailureE
     note's core principle — a forged or replayed webhook cannot move
     this system's state on its own, only trigger a lookup.
 
-    The exact field name Nomba's order-status response uses for
-    status isn't confirmed by the training material seen so far (only
-    checkout creation's response shape — checkoutUrl — was confirmed).
-    This checks several plausible field names/values defensively
-    rather than betting on one; confirm the real shape against a live
-    sandbox order lookup before the demo and simplify this once known.
+    CORRECTED: the official developer.nomba.com sandbox-testing doc's
+    real "verify a transaction" example confirms the response shape:
+    `data.success` (boolean) and `data.message` /
+    `data.transactionDetails.statusCode` (both text, observed value
+    "PAYMENT SUCCESSFUL"). An earlier version of this function didn't
+    have this confirmed shape and checked several generic guessed
+    field names instead (status/orderStatus/paymentStatus) — those are
+    kept as a fallback only, in case a real response ever differs from
+    this doc's specific example.
     """
     if not event.recovery_checkout_order_id:
         return event
 
     order = await nomba_client.get_checkout_order_status(event.recovery_checkout_order_id)
 
+    # Confirmed primary signal: an explicit boolean.
+    if order.get("success") is True:
+        event.status = FailureStatus.RECOVERED
+        event.recovered_at = datetime.now(timezone.utc)
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return event
+    if order.get("success") is False:
+        return event
+
+    # Confirmed secondary signal: text status, either at the top level
+    # or nested under transactionDetails.statusCode per the real
+    # example. Falls back to older guessed field names only if neither
+    # confirmed field is present at all (e.g. a differently-shaped
+    # production response).
     status_value = (
-        order.get("status")
+        order.get("message")
+        or _safe_get(order, "transactionDetails", "statusCode")
+        or order.get("status")
         or order.get("orderStatus")
         or order.get("paymentStatus")
         or ""
     )
     status_value = str(status_value).upper()
 
-    if status_value in ("SUCCESS", "SUCCESSFUL", "PAYMENT_SUCCESS", "COMPLETED", "PAID"):
+    if status_value in (
+        "PAYMENT SUCCESSFUL",
+        "SUCCESS",
+        "SUCCESSFUL",
+        "PAYMENT_SUCCESS",
+        "COMPLETED",
+        "PAID",
+    ):
         event.status = FailureStatus.RECOVERED
         event.recovered_at = datetime.now(timezone.utc)
         db.add(event)

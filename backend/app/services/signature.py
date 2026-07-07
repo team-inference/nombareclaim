@@ -1,10 +1,14 @@
 """
 Nomba webhook signature verification.
 
-CONFIRMED against Nomba's own official training documentation
-(training.nomba.com, "Webhooks" module) — this is no longer a
-best-guess implementation, it matches their documented Node.js
-reference sample exactly:
+CORRECTION — this file previously treated a training-certification
+quiz (training.nomba.com) as the confirmed source for webhook shape.
+Nomba's real, current, official developer docs
+(developer.nomba.com/docs/products/accept-payment/sandbox-testing)
+were located afterward and are now treated as authoritative wherever
+the two disagree — an official API reference beats a training quiz.
+
+Confirmed against that official doc's Node.js-equivalent reference:
 
     const signature = req.header("nomba-signature");
     const expected = crypto
@@ -14,25 +18,23 @@ reference sample exactly:
 
     if (signature !== expected) return res.status(401).send("bad signature");
 
-Two things this confirms and corrects versus an earlier draft of this
-file:
-1. There is exactly ONE header (`nomba-signature`), not a separate
-   signature + timestamp pair. Nomba's own sample does not implement
-   timestamp-based replay protection at all.
-2. The HMAC is computed over the raw, unparsed request body bytes —
-   NOT a colon-joined reconstruction of individual JSON fields. This
-   matters: hashing a re-serialized version of the parsed JSON can
-   produce a different byte sequence than what was actually sent
-   (whitespace, key order), which would make a genuinely valid
-   signature appear invalid. The raw body must be captured before any
-   JSON parsing happens, and hashed as-is.
+Still true and unchanged from the earlier version:
+- The HMAC is computed over the raw, unparsed request body bytes —
+  NOT a colon-joined reconstruction of individual JSON fields. The raw
+  body must be captured before any JSON parsing happens, and hashed
+  as-is.
+- Replay protection is via `event.requestId` idempotency (see
+  app/routes/webhooks.py), not a timestamp freshness window.
 
-Replay protection: Nomba's own documentation recommends idempotency
-via `event.requestId` — ignore an event if that requestId has already
-been processed — rather than a timestamp freshness window. This
-system implements exactly that (see app/routes/webhooks.py's
-idempotency_key check), so no separate timestamp-based replay check is
-needed or attempted here.
+CORRECTED: the official docs' signature table actually lists FOUR
+headers — `nomba-signature`, `nomba-sig-value`,
+`nomba-signature-algorithm`, `nomba-timestamp` — not the single header
+this file previously claimed was the only one. This is stated here for
+accuracy, but doesn't change what this system does: `nomba-signature`
+is still the one that matters for HMAC verification, and requestId
+idempotency is still used for replay protection rather than the
+timestamp header, since requestId dedup already covers the same
+problem without needing a freshness-window policy decision.
 """
 import hashlib
 import hmac
@@ -57,11 +59,25 @@ class ParsedEvent:
     transaction_type: Optional[str]
     transaction_time: Optional[str]
     response_code: Optional[str]
+    # Two DIFFERENT unit conventions were found confirmed in two
+    # different real sources — kept as separate fields rather than
+    # merged, so a caller never accidentally divides an
+    # already-naira value by 100 (or vice versa). See amount_kobo vs
+    # amount_naira docstring note on extract_event below.
     amount_kobo: Optional[str]
+    amount_naira: Optional[str]
     currency: Optional[str]
     customer_email: Optional[str]
     customer_phone: Optional[str]
     customer_name: Optional[str]
+    # Confirmed real field (data.order.orderReference) — this is
+    # literally the value NombaReclaim itself sets as `orderReference`
+    # when creating a recovery checkout, so it's the correct field to
+    # match a `payment_success` webhook back against
+    # FailureEvent.recovery_checkout_order_id. An earlier version of
+    # this system matched on transaction_id instead, which was never
+    # actually the right field for that purpose.
+    order_reference: Optional[str]
 
 
 def _safe_get(d: dict, *path, default=None):
@@ -104,50 +120,75 @@ def extract_event(payload: dict) -> ParsedEvent:
     since verification must happen on raw bytes, while field extraction
     naturally happens on the parsed dict afterwards.
 
-    Two payload shapes are checked, since no fully-confirmed shape
-    exists yet for the specific event this project cares about most
-    (a failed payment):
+    THREE payload shapes are checked now, in confirmation order:
 
-    - FLAT (confirmed by Nomba's own training material, shown for a
-      payment_success example): data.merchantTxRef, data.amount,
-      data.currency, directly under data.
-    - NESTED (an earlier, unconfirmed guess): data.transaction.*,
-      data.merchant.*.
+    1. NESTED, official (developer.nomba.com's actual sandbox-testing
+       doc, a real payment_success example):
+       data.transaction.merchantTxRef, data.transaction.transactionId,
+       data.transaction.transactionAmount, data.order.orderReference,
+       data.order.customerEmail, data.order.amount,
+       data.order.currency, data.merchant.userId. This is now the
+       PRIMARY source — it's an official, current API reference, not
+       a training quiz.
+    2. FLAT (training.nomba.com's certification quiz — kept as a
+       fallback only, since the official doc above supersedes it
+       where they disagree): data.merchantTxRef, data.amount,
+       data.currency, directly under data.
+    3. NESTED, unconfirmed guess (data.transaction.type/time/
+       responseCode) — kept since neither confirmed source shows a
+       failed-payment example specifically, only payment_success.
 
-    The flat shape is tried first since it's the one actually
-    confirmed by official material; the nested shape is kept as a
-    fallback in case a failure-specific event turns out to carry
-    richer nested detail (e.g. responseCode) that the flat
-    payment_success example didn't need to show. event_type is read
-    from either "event_type" or "event" for the same reason — see
-    routes/webhooks.py's FAILURE_EVENT_TYPES comment for the full
-    context on what's confirmed versus still open.
+    CRITICAL unit-of-currency catch: the official doc's example shows
+    `data.order.amount` / `data.transaction.transactionAmount` as
+    4000.00 for a checkout ORDER that was created with
+    `"amount": "400000.00"` — i.e. these webhook fields are already in
+    NAIRA, not kobo. This directly conflicts with the flat shape's
+    confirmed `data.amount: 250000` for a ₦2,500 charge, which IS kobo.
+    Blindly merging both into one "amount_kobo" field and dividing by
+    100 would silently under-report the official-shape amount by 100x.
+    They're kept in separate fields (amount_kobo, amount_naira) for
+    exactly this reason — see routes/webhooks.py for how they're
+    reconciled into a single stored value.
     """
-    flat_amount = _safe_get(payload, "data", "amount")
-    nested_amount = _safe_get(payload, "data", "transaction", "amount")
+    flat_amount_kobo = _safe_get(payload, "data", "amount")
+    nested_amount_kobo_guess = _safe_get(payload, "data", "transaction", "amount")
+    confirmed_amount_naira = (
+        _safe_get(payload, "data", "order", "amount")
+        if _safe_get(payload, "data", "order", "amount") is not None
+        else _safe_get(payload, "data", "transaction", "transactionAmount")
+    )
 
     return ParsedEvent(
         event_type=payload.get("event_type") or payload.get("event") or "",
         request_id=payload.get("requestId", ""),
-        merchant_tx_ref=_safe_get(payload, "data", "merchantTxRef"),
+        merchant_tx_ref=(
+            _safe_get(payload, "data", "transaction", "merchantTxRef")
+            or _safe_get(payload, "data", "merchantTxRef")
+        ),
         merchant_user_id=_safe_get(payload, "data", "merchant", "userId"),
         wallet_id=_safe_get(payload, "data", "merchant", "walletId"),
         transaction_id=(
-            _safe_get(payload, "data", "merchantTxRef")
-            or _safe_get(payload, "data", "transaction", "transactionId")
+            _safe_get(payload, "data", "transaction", "transactionId")
+            or _safe_get(payload, "data", "merchantTxRef")
         ),
+        order_reference=_safe_get(payload, "data", "order", "orderReference"),
         transaction_type=_safe_get(payload, "data", "transaction", "type"),
         transaction_time=_safe_get(payload, "data", "transaction", "time"),
         response_code=_safe_get(payload, "data", "transaction", "responseCode"),
-        amount_kobo=flat_amount if flat_amount is not None else nested_amount,
-        currency=_safe_get(payload, "data", "currency") or _safe_get(payload, "data", "transaction", "currency"),
-        # Not present in Nomba's confirmed payment_success example, and
-        # not guaranteed to exist on a failure event either — checked
-        # defensively across every plausible field name/nesting so the
-        # automated recovery-notification pipeline can use it when it
-        # IS there, without assuming it always will be.
+        amount_kobo=flat_amount_kobo if flat_amount_kobo is not None else nested_amount_kobo_guess,
+        amount_naira=confirmed_amount_naira,
+        currency=(
+            _safe_get(payload, "data", "order", "currency")
+            or _safe_get(payload, "data", "currency")
+            or _safe_get(payload, "data", "transaction", "currency")
+        ),
+        # data.order.customerEmail is now a CONFIRMED real field (not
+        # a guess) per the official sandbox-testing doc — checked
+        # first. The others remain defensive fallbacks for shapes not
+        # explicitly confirmed for a *failed* payment specifically.
         customer_email=(
-            _safe_get(payload, "data", "customerEmail")
+            _safe_get(payload, "data", "order", "customerEmail")
+            or _safe_get(payload, "data", "customerEmail")
             or _safe_get(payload, "data", "customer", "email")
             or _safe_get(payload, "data", "email")
         ),

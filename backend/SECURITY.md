@@ -178,56 +178,112 @@ while scoping the header correctly per the brief. Worth confirming
 against a real sandbox transaction if checkout orders ever appear
 under the wrong sub-account in Nomba's own reporting.
 
-## 7b. Confirmed API details (from Nomba's official training material)
+## 7b. Confirmed API details — CORRECTED against Nomba's real official docs
 
-The following were corrected after reviewing Nomba's own developer
-certification training material directly (not third-party pages),
-replacing earlier guesses that turned out to be wrong:
+**Important update**: everything in this section was originally
+written against Nomba's training-certification material
+(training.nomba.com, a quiz-style onboarding course). Nomba's real,
+current, official developer docs (developer.nomba.com) were located
+afterward, during live debugging when the sandbox host turned out not
+to resolve via DNS at all. Wherever the two disagree, the official
+docs are now treated as authoritative — a live API reference beats a
+training quiz, however official-sounding the quiz seemed at the time.
+Several things below were themselves wrong as a result and are now
+corrected a second time:
 
-- **Sandbox and production are separate hosts**, not the same host
-  with different credentials:
-  - Sandbox (all hackathon work): `https://sandbox.api.nomba.com/v1`
-  - Production (post-KYC only): `https://api.nomba.com/v1`
-  An earlier draft of `app/config.py` assumed a single shared host —
-  that was wrong and has been corrected.
-- **Amounts are in kobo**, as integers, everywhere in Nomba's API —
-  confirmed by their own example (`amount: 250000` for a ₦2,500.00
-  charge). This system stores and displays amounts in naira
-  throughout (matching the shared dashboard API contract), so the
-  kobo↔naira conversion happens at exactly one boundary —
-  `app/services/nomba_client.py`'s `_naira_to_kobo`/`_kobo_to_naira`
-  helpers — and nowhere else in the codebase needs to think about
-  kobo. An earlier draft sent a decimal-string naira amount directly
-  to Nomba's API, which would have been a real ~100x financial
-  correctness bug had it gone uncaught before a real transaction.
-- **Checkout response field is `checkoutUrl`**, not `checkoutLink` —
-  an earlier draft had this field name wrong, which would have caused
-  every recovery-checkout creation to fail with a "missing checkoutUrl"
-  error against the real API despite looking correct against no live
-  credentials to test with.
-- **A confirmed direct status endpoint exists**:
-  `GET /checkout/order/{orderReference}`. This replaced an earlier,
-  unconfirmed guess that queried a `/transactions/accounts` list
-  endpoint and filtered results client-side.
-- **Webhook payload shape**: Nomba's own confirmed example for a
-  `payment_success` event uses a flat structure —
-  `data.merchantTxRef`, `data.amount`, `data.currency` directly under
-  `data` — not the deeply nested `data.transaction.transactionId`
-  structure an earlier draft assumed. `services/signature.py`'s
-  `extract_event()` now tries the confirmed flat shape first, falling
-  back to the nested guess only if the flat fields aren't present,
-  since no confirmed shape exists yet specifically for a *failed*
-  payment event (only the success-side example was shown).
+- **The sandbox hostname itself was wrong.** `https://sandbox.api.nomba.com/v1`
+  (from the training quiz) is not a real domain — confirmed
+  non-resolving against two independent DNS resolvers (a Railway
+  deployment's own DNS, and Google's 8.8.8.8) during live debugging.
+  The real sandbox host, per the official docs, is
+  `https://sandbox.nomba.com` — no `api.` subdomain. Production is
+  unaffected: `https://api.nomba.com`.
+- **Sandbox checkout endpoints live under a different path prefix
+  entirely** — `/sandbox/checkout/...`, not `/v1/checkout/...`. This
+  isn't just a different host; it's a genuinely different path
+  structure for checkout-specific operations. Auth
+  (`/v1/auth/token/issue`) is NOT affected — same `/v1` prefix in both
+  environments. `app/services/nomba_client.py` now branches on
+  whether `NOMBA_API_BASE_URL` contains "sandbox" to pick the right
+  prefix (`_checkout_path_prefix()`).
+- **Checkout response field is `checkoutLink`, not `checkoutUrl`** —
+  the training quiz's claim that `checkoutUrl` was confirmed was
+  itself wrong. The official doc's real example response shows
+  `data.checkoutLink`. Both are now accepted defensively
+  (`checkoutLink` preferred), in case a real response ever differs
+  from this specific example.
+- **The transaction-verification endpoint is different than
+  previously coded.** Previously: `GET /checkout/order/{orderReference}`
+  (an unconfirmed guess, never actually verified against a real
+  response). Actually, per the official doc:
+  `GET /sandbox/checkout/transaction?idType=orderReference&id={ref}`
+  in sandbox. Response shape is also now confirmed: `data.success`
+  (boolean) and `data.message` / `data.transactionDetails.statusCode`
+  (text, observed value `"PAYMENT SUCCESSFUL"`) — `services/recovery.py`'s
+  `confirm_recovery_if_paid` now checks these as the primary signal,
+  with the earlier guessed field names kept only as a fallback.
+- **Webhook payload shape is nested, with a confirmed `customerEmail`
+  field** — `data.transaction.merchantTxRef`,
+  `data.transaction.transactionId`, `data.order.orderReference`,
+  `data.order.customerEmail`, `data.merchant.userId`. This directly
+  contradicts the earlier belief that the training quiz's FLAT shape
+  (`data.merchantTxRef`, `data.amount` directly under `data`) was the
+  confirmed one — that flat shape is now kept only as a fallback for
+  payloads that don't match the official nested shape.
+  **Practically important**: `data.order.customerEmail` being a
+  confirmed real field (not a defensive guess) means the automated
+  recovery email pipeline (section 11) has a much better chance of
+  actually having a real address to send to than previously assumed.
+- **A genuine, still-unresolved conflict on amount units between the
+  two doc sources.** The training quiz's flat shape
+  (`data.amount: 250000` for ₦2,500.00) is in KOBO. The official
+  doc's nested shape (`data.order.amount` / `data.transaction.transactionAmount`,
+  both showing `4000.00` for a checkout order that was created with
+  `"amount": "400000.00"`) is in NAIRA — i.e. already the actual
+  currency unit, not kobo. Blindly merging both into one field and
+  dividing by 100 would have silently under-reported the
+  officially-shaped amount by 100x. `services/signature.py`'s
+  `ParsedEvent` now keeps `amount_kobo` and `amount_naira` as
+  separate fields for exactly this reason; `routes/webhooks.py`'s
+  `_resolve_amount_naira()` prefers the confirmed-naira value when
+  present, falling back to the kobo conversion only when it's absent.
+- **A separate, still-unresolved conflict on amount units for the
+  REQUEST body specifically** (different from the webhook conflict
+  above): the official sandbox-testing doc's checkout-creation
+  example sends `"amount": "400000.00"` — a DECIMAL STRING — while
+  this client still sends an INTEGER (`250000`), matching the
+  training quiz's convention. Not changed without a live test to
+  confirm which format the real API actually accepts; if a real
+  sandbox checkout creation call fails with a format complaint, try
+  the decimal-string variant next.
+- **Recovery confirmation now matches on the correct field.**
+  `data.order.orderReference` is confirmed to be exactly the value
+  this system itself sets as `orderReference` when creating a
+  recovery checkout (see `services/recovery.py`). An earlier version
+  matched an incoming `payment_success` webhook against
+  `transaction_id` instead, which was never actually the right field
+  for this purpose — kept as a fallback only for payloads without a
+  separate `order` object.
 - **Still genuinely open, not resolved by any source seen so far**:
-  whether Nomba's actual failed-payment webhook event is literally
-  named `PAYMENT_FAILED` — the "common event types" list in the
-  training material does not include a failure event at all (only
-  `payment_success`, `virtual_account.funded`, `transfer.success`,
-  `transfer.failed`, `mandate.debit_success`), while a different
-  endpoint's reference (event-log/replay filter values) does list
-  `PAYMENT_FAILED` as valid. The authoritative source — the literal
-  event name shown in Nomba's real dashboard when registering a
-  webhook and selecting which events to receive — should be checked
+  the official doc's confirmed example is for `payment_success` — it
+  does not show a failed-payment example at all, so the real event
+  name for a failed payment remains unconfirmed by ANY source, official
+  doc or training quiz. Confirm it by triggering a real sandbox
+  failure with the official doc's documented decline test card
+  (`5484497218317651`, "do not honor" response) and inspecting what
+  actually arrives, or by asking Nomba/DevCareer directly what event
+  name their webhook-forwarding for this hackathon actually sends —
+  see section 16 below, this is exactly what blocked visible dashboard
+  data for a period during the build.
+- Also corrected: the earlier claim that there is exactly ONE webhook
+  header and no timestamp header at all was itself wrong — the
+  official doc's signature section lists FOUR headers
+  (`nomba-signature`, `nomba-sig-value`, `nomba-signature-algorithm`,
+  `nomba-timestamp`). This doesn't change what the system does —
+  `nomba-signature` is still the one used for HMAC verification, and
+  `requestId` idempotency is still used for replay protection rather
+  than the timestamp header — but the earlier claim of "exactly one
+  header" was factually wrong and is corrected here for accuracy.
   directly before the demo. Nomba's sandbox also ships real test
   instruments for exactly this purpose: a documented "insufficient
   funds" test card (`5060 6666 6666 6666 674`) that can trigger a
@@ -395,3 +451,32 @@ the webhook payload today, not phone number, even though the
 the checkout order body's sub-account scoping (as opposed to the
 header, which is fixed) remains genuinely unconfirmed (see section 7).
 None of this is hidden in the demo.
+
+## 16. How the training-quiz-vs-official-docs discrepancy was found
+
+Worth recording plainly, since it materially changed several
+"confirmed" claims in this document: for most of the build, this
+system was validated against Nomba's training-certification quiz
+(training.nomba.com), including its stated sandbox host
+`https://sandbox.api.nomba.com/v1`. That host never actually worked —
+confirmed via `nslookup` against two independent DNS resolvers (a
+local resolver and Google's `8.8.8.8`), both returning NXDOMAIN, during
+live debugging of why the deployed dashboard showed zero data despite
+credentials being correctly configured on Railway.
+
+Searching for the real sandbox host surfaced Nomba's actual, current,
+official developer documentation at `developer.nomba.com` — a
+genuinely different site than the training quiz, with its own API
+reference, sandbox-testing guide, and real request/response examples.
+Cross-checking against it surfaced every correction listed in section
+7b above, several of which (`checkoutLink` vs `checkoutUrl`, the
+transaction-verification endpoint, the webhook payload shape) would
+otherwise have caused real, hard-to-diagnose failures the first time
+this system tried to talk to Nomba's actual sandbox rather than a
+non-existent host.
+
+The lesson generalized: a training/certification quiz and a live API
+reference are not the same category of source, even when both claim
+official status, and a live DNS/connectivity failure is worth treating
+as a signal to re-verify assumptions rather than just a networking
+inconvenience to work around.

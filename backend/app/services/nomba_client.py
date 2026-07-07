@@ -1,38 +1,69 @@
 """
 Thin wrapper around the Nomba API.
 
-Grounded against Nomba's own official developer certification training
-material (training.nomba.com, downloaded PDF) — this replaces an
-earlier version that had to guess several of these details from public
-doc pages alone. Two things below were previously WRONG and are fixed
-here:
+CORRECTION — this file previously treated Nomba's training-
+certification material (training.nomba.com, downloaded PDF) as the
+confirmed source for these API shapes. Nomba's real, current, official
+developer docs (developer.nomba.com) were located afterward and are
+now treated as authoritative wherever the two disagree — a live API
+reference beats a training quiz, however official-sounding the quiz
+seemed at the time. Several things below were corrected as a result:
 
-1. Sandbox is a SEPARATE HOST, not the same host with different
-   credentials: https://sandbox.api.nomba.com/v1 for all hackathon
-   work, https://api.nomba.com/v1 only after KYC/production. An
-   earlier version of this file incorrectly assumed one shared host.
-2. Checkout amounts are in KOBO, as an INTEGER — not a decimal-string
-   naira amount. ₦1.00 is 100 kobo; the training material's own
-   example sends `amount: 250000` for a ₦2,500.00 charge. This system
-   stores amounts internally in naira (matching the shared dashboard
-   API contract, e.g. `"amount": 15000` meaning ₦15,000), so the
-   naira<->kobo conversion happens at this module's boundary in both
-   directions — nowhere else in the codebase should need to think
-   about kobo at all.
+1. THE SANDBOX HOSTNAME ITSELF WAS WRONG. The training material's
+   `https://sandbox.api.nomba.com/v1` is not a real domain — it does
+   not resolve via DNS at all (confirmed against two independent
+   resolvers). The real sandbox host, per developer.nomba.com, is
+   `https://sandbox.nomba.com` (no `api.` subdomain). Production is
+   `https://api.nomba.com`, which was already correct.
 
-Confirmed shapes:
+2. SANDBOX CHECKOUT ENDPOINTS LIVE UNDER A DIFFERENT PATH PREFIX,
+   `/sandbox/checkout/...`, NOT `/v1/checkout/...`. This isn't just a
+   different host — the sandbox and production APIs use genuinely
+   different paths for checkout-specific operations. Auth
+   (`/v1/auth/token/issue`) is NOT affected — it's the same `/v1`
+   prefix in both environments. This client now branches on whether
+   NOMBA_API_BASE_URL contains "sandbox" to pick the right prefix —
+   see _checkout_path_prefix() below.
 
-- Auth: POST {base}/auth/token/issue, header `accountId: <parent
+3. CHECKOUT ORDER RESPONSE FIELD IS `checkoutLink`, NOT `checkoutUrl`.
+   The training material's claim that it was confirmed as `checkoutUrl`
+   was itself wrong; the official doc's real example response shows
+   `data.checkoutLink`. Both are now accepted defensively (checkoutLink
+   preferred), in case production ever differs from the sandbox
+   example shown.
+
+4. THE TRANSACTION-VERIFICATION ENDPOINT IS DIFFERENT THAN PREVIOUSLY
+   CODED. Previously: `GET {base}/checkout/order/{orderReference}`
+   (an unconfirmed guess). Actually, per the official sandbox-testing
+   doc: `GET /sandbox/checkout/transaction?idType=orderReference&id=
+   {ref}` in sandbox (production's exact query-param behavior at
+   `/v1/checkout/transaction` is inferred from the difference table,
+   not shown with its own full example — worth confirming against a
+   real production transaction if this ever goes live).
+
+5. Checkout amounts: still sent as INTEGER KOBO here (the
+   training-quiz convention), NOT changed to match the official
+   sandbox-testing doc's example, which oddly shows a DECIMAL STRING
+   ("400000.00") for the same value. This is a genuine, unresolved
+   conflict between two real doc sources on wire format for the
+   REQUEST body specifically (separate from the webhook AMOUNT UNIT
+   conflict already handled in routes/webhooks.py's
+   _resolve_amount_naira). Kept as integer kobo since that's what
+   this client already sends successfully-shaped requests with; if a
+   real sandbox checkout creation call fails with a format complaint,
+   try the decimal-string-kobo variant next, in that order.
+
+Confirmed shapes (now cross-checked against the official
+developer.nomba.com sandbox-testing doc):
+
+- Auth: POST {base}/v1/auth/token/issue, header `accountId: <parent
   accountId>`, body {"grant_type": "client_credentials", "client_id":
-  ..., "client_secret": ...}. Returns `data.access_token`, valid 60
-  minutes (this client refreshes early, well before that).
+  ..., "client_secret": ...}. Returns `data.access_token`.
 
-- Checkout order creation: POST {base}/checkout/order, headers
-  Authorization (bearer token) + accountId + Content-Type. Body:
-  {"order": {orderReference, amount (INTEGER KOBO), currency,
-  callbackUrl, customerId, customerEmail}}. Response:
-  `data.checkoutUrl` (NOT `checkoutLink` — an earlier version of this
-  file had this field name wrong).
+- Checkout order creation: POST {base}/sandbox/checkout/order
+  (sandbox) or {base}/v1/checkout/order (production), headers
+  Authorization (bearer token) + accountId + Content-Type. Response:
+  `data.checkoutLink` (primary) / `data.checkoutUrl` (fallback).
 
   **accountId scoping, per Nomba's own credentials brief for this
   hackathon** ("Authenticate with the parent Account ID in the
@@ -40,28 +71,13 @@ Confirmed shapes:
   token issuance (_get_access_token) uses the PARENT accountId
   (NOMBA_ACCOUNT_ID); every call made AFTER auth — checkout order
   creation, status lookup — uses the SUB-ACCOUNT accountId
-  (NOMBA_SUBACCOUNT_ID) via _auth_headers(). An earlier version of
-  this file sent the parent accountId on every call including
-  post-auth resource calls, which NOMBA_SUBACCOUNT_ID (defined in
-  config.py) was never actually wired into — fixed to match the
-  credentials brief exactly.
+  (NOMBA_SUBACCOUNT_ID) via _auth_headers().
 
-- Checkout order status lookup: GET {base}/checkout/order/{orderReference}
-  — a direct, confirmed endpoint. This replaces an earlier guessed
-  implementation that queried a `/transactions/accounts` list endpoint
-  and filtered client-side; that guess is no longer needed now that a
-  direct lookup is confirmed to exist.
-
-Still open / not confirmed by any source seen so far, and worth
-checking against a real sandbox test before the demo (see
-SECURITY.md):
-- Whether the checkout order BODY (not just the header) needs an
-  explicit sub-account field nested inside `order` as well — the
-  confirmed training example's request body doesn't include one, and
-  the credentials brief only specifies the *header*. This client
-  currently does NOT add one to the body, matching the confirmed
-  training example exactly, while still scoping the header correctly
-  per the credentials brief above.
+- Transaction verification: GET {base}/sandbox/checkout/transaction?
+  idType=orderReference&id={order_reference} (sandbox) or
+  {base}/v1/checkout/transaction?idType=orderReference&id={ref}
+  (production, inferred). Response: `data.success` (bool),
+  `data.message` / `data.transactionDetails.statusCode` (text status).
 """
 import time
 from typing import Optional
@@ -73,6 +89,29 @@ from app.config import settings
 
 class NombaAPIError(Exception):
     pass
+
+
+def _root_host() -> str:
+    """NOMBA_API_BASE_URL is stored WITH a trailing /v1 (e.g.
+    "https://sandbox.nomba.com/v1"), matching the auth endpoint's
+    path. Checkout-specific sandbox endpoints hang directly off the
+    root host instead (/sandbox/checkout/...), so this strips /v1
+    back off when building those URLs."""
+    base = settings.NOMBA_API_BASE_URL.rstrip("/")
+    if base.endswith("/v1"):
+        return base[: -len("/v1")]
+    return base
+
+
+def _is_sandbox() -> bool:
+    return "sandbox" in settings.NOMBA_API_BASE_URL.lower()
+
+
+def _checkout_path_prefix() -> str:
+    """/sandbox/checkout in sandbox, /v1/checkout in production — a
+    genuinely different path structure per environment, not just a
+    different host. See module docstring point 2."""
+    return "/sandbox/checkout" if _is_sandbox() else "/v1/checkout"
 
 
 class _TokenCache:
@@ -150,11 +189,13 @@ async def create_checkout_order(
 ) -> dict:
     """
     amount is the integer NAIRA amount as stored on FailureEvent —
-    converted to integer kobo here before sending, per Nomba's
-    confirmed convention. Callers elsewhere in this codebase never
-    need to think about kobo.
+    converted to integer kobo here before sending. Callers elsewhere
+    in this codebase never need to think about kobo.
+
+    URL is environment-aware: /sandbox/checkout/order in sandbox,
+    /v1/checkout/order in production — see module docstring point 2.
     """
-    url = f"{settings.NOMBA_API_BASE_URL}/checkout/order"
+    url = f"{_root_host()}{_checkout_path_prefix()}/order"
     headers = await _auth_headers()
     body = {
         "order": {
@@ -173,9 +214,11 @@ async def create_checkout_order(
 
     payload = resp.json()
     data = payload.get("data", {})
-    checkout_url = data.get("checkoutUrl")
+    # checkoutLink is the confirmed field per the official
+    # sandbox-testing doc; checkoutUrl kept as a fallback only.
+    checkout_url = data.get("checkoutLink") or data.get("checkoutUrl")
     if not checkout_url:
-        raise NombaAPIError(f"checkout order response missing checkoutUrl: {payload}")
+        raise NombaAPIError(f"checkout order response missing checkoutLink: {payload}")
 
     return {
         "checkout_url": checkout_url,
@@ -185,15 +228,23 @@ async def create_checkout_order(
 
 async def get_checkout_order_status(order_reference: str) -> dict:
     """
-    Server-side verification lookup, using the confirmed direct status
-    endpoint. NEVER trust a webhook payload alone to mark something
-    RECOVERED — always cross-check against this before flipping status.
-    See services/recovery.py.
+    Server-side verification lookup. NEVER trust a webhook payload
+    alone to mark something RECOVERED — always cross-check against
+    this before flipping status. See services/recovery.py.
+
+    URL and query params are environment-aware, per the official
+    sandbox-testing doc: GET /sandbox/checkout/transaction?
+    idType=orderReference&id={ref} in sandbox. Production's exact
+    query-param behavior at /v1/checkout/transaction is inferred from
+    the doc's sandbox-vs-production difference table, not shown with
+    its own full example — worth confirming against a real production
+    transaction before this ever handles real money.
     """
-    url = f"{settings.NOMBA_API_BASE_URL}/checkout/order/{order_reference}"
+    url = f"{_root_host()}{_checkout_path_prefix()}/transaction"
+    params = {"idType": "orderReference", "id": order_reference}
     headers = await _auth_headers()
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.get(url, headers=headers, params=params)
     if resp.status_code == 404:
         return {}
     if resp.status_code >= 400:

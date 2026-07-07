@@ -18,40 +18,28 @@ router = APIRouter()
 
 # Event types that represent a failed/abandoned payment and should be
 # stored as a recoverable FailureEvent, vs. a success event that might
-# confirm a recovery in progress. Both are now configurable via
+# confirm a recovery in progress. Both are configurable via
 # NOMBA_FAILURE_EVENT_TYPES / NOMBA_SUCCESS_EVENT_TYPES (see
-# config.py) rather than hardcoded here, specifically because neither
-# is fully confirmed by any doc source seen so far:
+# config.py) rather than hardcoded here.
 #
-# IMPORTANT — genuinely unresolved, flagged rather than guessed past:
-# Nomba's own training material's "Common event types" table lists
-# only payment_success, virtual_account.funded, transfer.success,
-# transfer.failed, mandate.debit_success — it does NOT include a
-# payment-failed event at all. A separate, different endpoint's
-# reference (the event-log/replay API) lists PAYMENT_FAILED as a valid
-# eventType filter value, which is reasonable evidence a failure event
-# exists under that name, but it is not the same confirmation as
-# seeing it in the webhook "common events" list.
+# CORRECTED: Nomba's real, official developer docs
+# (developer.nomba.com/docs/products/accept-payment/sandbox-testing)
+# were located after the training-certification quiz was first treated
+# as the confirmed source. The official doc's real payment_success
+# webhook example uses `"event_type": "payment_success"` (lowercase
+# value, field name "event_type") — this settles the earlier
+# uncertainty about field name/casing in favor of "event_type", though
+# matching here still stays case-insensitive as cheap extra safety.
 #
-# ACTION BEFORE THE DEMO: when registering the webhook on Nomba's real
-# dashboard, there is an event-selection step ("select the events you
-# will like to be notified on") — the literal event name shown there
-# is the authoritative source, more reliable than either doc page.
-# Confirm it there and update NOMBA_FAILURE_EVENT_TYPES (an env var,
-# no redeploy needed) if it differs from "PAYMENT_FAILED".
-# Alternatively, trigger a real sandbox failure using the documented
-# test card (5060 6666 6666 6666 674 — the "insufficient funds" test
-# card) and inspect what actually arrives.
-#
-# Matching is case-insensitive and checks both "event_type" and
-# "event" as the field name (see services/signature.py's extract_event)
-# since a training quiz payload used lowercase under "event" while
-# this endpoint's own docs use uppercase under (presumably) "event_type"
-# — neither source fully confirms the real production field name either.
-#
-# No dedicated "abandoned" event type appears in Nomba's documented
-# list at all — USER_ABANDONED classification currently can only be
-# reached via the AI-ambiguous-case path, not a dedicated event type.
+# STILL genuinely unresolved: the official doc's example is for
+# payment_success — it does not show a failed-payment example at all,
+# so the real event name for a failed payment remains unconfirmed by
+# ANY source seen so far, official or training quiz. Confirm it by
+# triggering a real sandbox failure with the documented "do not honor"
+# decline test card (5484497218317651 per the official sandbox-testing
+# doc) and inspecting what actually arrives, or by asking Nomba/
+# DevCareer directly what event name their webhook-forwarding for this
+# hackathon actually sends.
 
 
 def _normalize_event_type(event_type: str) -> str:
@@ -95,14 +83,40 @@ async def _run_classification(event_id: str):
 
 
 def _kobo_to_naira(amount_kobo) -> int:
-    """Nomba's confirmed convention: amounts are in kobo. This system
-    stores and displays naira throughout (matching the shared dashboard
-    API contract), so the conversion happens once, right here at
-    ingestion — nothing downstream needs to think about kobo."""
+    """Training-quiz-confirmed convention: amounts are in kobo. Still
+    used as a fallback path — see _resolve_amount_naira below for why
+    this is no longer the only path."""
     try:
         return round(float(amount_kobo) / 100)
     except (TypeError, ValueError):
         return 0
+
+
+def _resolve_amount_naira(verified) -> int:
+    """
+    Reconciles the two confirmed-but-conflicting amount unit
+    conventions found across two different Nomba doc sources (see
+    services/signature.py's extract_event docstring for the full
+    explanation):
+
+    - The official developer.nomba.com sandbox-testing doc's real
+      webhook example (`data.order.amount` /
+      `data.transaction.transactionAmount`) is already in NAIRA.
+    - The training-certification quiz's signature-lab example
+      (`data.amount`) is in KOBO.
+
+    Prefers the officially-confirmed naira value when present (it's
+    from a real, current API reference); falls back to the kobo
+    conversion only when that field is absent, on the assumption that
+    a payload using the flat/training shape is following that shape's
+    kobo convention too.
+    """
+    if verified.amount_naira is not None:
+        try:
+            return round(float(verified.amount_naira))
+        except (TypeError, ValueError):
+            pass
+    return _kobo_to_naira(verified.amount_kobo)
 
 
 @router.post("/webhooks/nomba")
@@ -158,6 +172,16 @@ async def receive_nomba_webhook(
         # Look for a FailureEvent whose recovery checkout this success
         # event might correspond to, then verify server-side before
         # flipping status — never trust the webhook payload alone.
+        #
+        # CORRECTED: match on data.order.orderReference (the confirmed
+        # real field, and literally the value we ourselves set when
+        # creating the recovery checkout — see services/recovery.py),
+        # not transaction_id. An earlier version matched on
+        # transaction_id, which was never actually the right field for
+        # this purpose; kept as a fallback only for payloads following
+        # the older flat/training-quiz shape that has no separate order
+        # object at all.
+        match_reference = verified.order_reference or verified.transaction_id
         candidate = (
             db.query(FailureEvent)
             .filter(
@@ -166,7 +190,7 @@ async def receive_nomba_webhook(
             )
             .filter(
                 FailureEvent.recovery_checkout_order_id
-                == verified.transaction_id
+                == match_reference
             )
             .first()
         )
@@ -188,7 +212,7 @@ async def receive_nomba_webhook(
         wallet_id=verified.wallet_id,
         event_type=normalized_event_type,
         transaction_type=verified.transaction_type,
-        amount=_kobo_to_naira(verified.amount_kobo),
+        amount=_resolve_amount_naira(verified),
         currency=verified.currency or "NGN",
         response_code=verified.response_code,
         customer_email=verified.customer_email,
