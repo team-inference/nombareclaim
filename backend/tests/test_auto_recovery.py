@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -15,11 +16,39 @@ init_db()
 client = TestClient(app)
 
 SIGNATURE_KEY = "test_webhook_secret_123"
+TIMESTAMP = "1751500000"
 
 
-def _signed_headers(raw_body: bytes) -> dict:
-    sig = hmac.new(SIGNATURE_KEY.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return {"nomba-signature": sig, "Content-Type": "application/json"}
+def _sign(payload: dict, timestamp: str = TIMESTAMP) -> str:
+    """Matches Nomba's real documented scheme (see services/signature.py):
+    HMAC-SHA256, Base64-encoded, over specific parsed fields plus the
+    nomba-timestamp header value — NOT a hash of the raw body."""
+    data = payload.get("data", {}) or {}
+    merchant = data.get("merchant", {}) or {}
+    transaction = data.get("transaction", {}) or {}
+    signing_string = ":".join(
+        [
+            payload.get("event_type", "") or "",
+            payload.get("requestId", "") or "",
+            merchant.get("userId", "") or "",
+            merchant.get("walletId", "") or "",
+            transaction.get("transactionId", "") or "",
+            transaction.get("type", "") or "",
+            transaction.get("time", "") or "",
+            transaction.get("responseCode", "") or "",
+            timestamp,
+        ]
+    )
+    digest = hmac.new(SIGNATURE_KEY.encode("utf-8"), signing_string.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _signed_headers(payload: dict, timestamp: str = TIMESTAMP) -> dict:
+    return {
+        "nomba-signature": _sign(payload, timestamp),
+        "nomba-timestamp": timestamp,
+        "Content-Type": "application/json",
+    }
 
 
 async def _fake_create_checkout_order(**kwargs):
@@ -49,7 +78,7 @@ def test_auto_recovery_fires_when_enabled_with_contact_and_score(monkeypatch):
         },
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(payload))
     assert resp.status_code == 200
     event_id = resp.json()["id"]
 
@@ -85,7 +114,7 @@ def test_auto_recovery_does_not_fire_when_disabled(monkeypatch):
         },
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(payload))
     assert resp.status_code == 200
     event_id = resp.json()["id"]
 
@@ -113,7 +142,7 @@ def test_configurable_failure_event_type(monkeypatch):
         },
     }
     raw_body = json.dumps(payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(payload))
     assert resp.status_code == 200
     assert resp.json()["status"] == "received"
 
@@ -122,6 +151,6 @@ def test_configurable_failure_event_type(monkeypatch):
     payload2 = {**payload, "event_type": "PAYMENT_FAILED", "requestId": "req-custom-event-type-2",
                 "data": {**payload["data"], "merchantTxRef": "txn-custom-event-type-2"}}
     raw_body2 = json.dumps(payload2).encode("utf-8")
-    resp2 = client.post("/webhooks/nomba", content=raw_body2, headers=_signed_headers(raw_body2))
+    resp2 = client.post("/webhooks/nomba", content=raw_body2, headers=_signed_headers(payload2))
     assert resp2.status_code == 200
     assert resp2.json()["status"] == "ignored"

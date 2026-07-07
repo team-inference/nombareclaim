@@ -1,41 +1,40 @@
 """
 Nomba webhook signature verification.
 
-CORRECTION — this file previously treated a training-certification
-quiz (training.nomba.com) as the confirmed source for webhook shape.
-Nomba's real, current, official developer docs
-(developer.nomba.com/docs/products/accept-payment/sandbox-testing)
-were located afterward and are now treated as authoritative wherever
-the two disagree — an official API reference beats a training quiz.
+CORRECTION (second pass) — the previous version of this file, and the
+"sandbox-testing" doc it was checked against, both assumed a plain
+HMAC-SHA256-hex over the RAW request body. That is wrong. Nomba's own
+dedicated Webhooks reference doc
+(developer.nomba.com/docs/api-basics/webhook) gives the actual
+reference implementation, and it's a completely different scheme:
 
-Confirmed against that official doc's Node.js-equivalent reference:
+- NOT a hash of the raw body. Instead, a colon-joined string built
+  from specific fields pulled out of the ALREADY-PARSED payload, in
+  this exact order:
+    event_type : requestId : data.merchant.userId :
+    data.merchant.walletId : data.transaction.transactionId :
+    data.transaction.type : data.transaction.time :
+    data.transaction.responseCode : <nomba-timestamp header value>
+  Any missing field is treated as an empty string, not omitted — the
+  colon separators still all appear.
+- HMAC-SHA256 over that string, then **Base64-encoded** — not hex.
+- Compared against the `nomba-signature` header, case-insensitively,
+  using `hmac.compare_digest`.
+- The `nomba-timestamp` header is not optional or advisory — its
+  value is one of the fields actually hashed. A request missing that
+  header can never produce a matching signature and must be rejected.
 
-    const signature = req.header("nomba-signature");
-    const expected = crypto
-      .createHmac("sha256", process.env.NOMBA_WEBHOOK_SECRET)
-      .update(req.body)      // the RAW request body, not a
-      .digest("hex");        // reconstructed/reserialized payload
+Practical consequence: since the fields being signed come from the
+parsed payload, JSON parsing must now happen BEFORE signature
+verification (previously the reverse, when we were hashing raw
+bytes). See app/routes/webhooks.py for the updated ordering.
 
-    if (signature !== expected) return res.status(401).send("bad signature");
-
-Still true and unchanged from the earlier version:
-- The HMAC is computed over the raw, unparsed request body bytes —
-  NOT a colon-joined reconstruction of individual JSON fields. The raw
-  body must be captured before any JSON parsing happens, and hashed
-  as-is.
+Still true and unchanged:
 - Replay protection is via `event.requestId` idempotency (see
-  app/routes/webhooks.py), not a timestamp freshness window.
-
-CORRECTED: the official docs' signature table actually lists FOUR
-headers — `nomba-signature`, `nomba-sig-value`,
-`nomba-signature-algorithm`, `nomba-timestamp` — not the single header
-this file previously claimed was the only one. This is stated here for
-accuracy, but doesn't change what this system does: `nomba-signature`
-is still the one that matters for HMAC verification, and requestId
-idempotency is still used for replay protection rather than the
-timestamp header, since requestId dedup already covers the same
-problem without needing a freshness-window policy decision.
+  app/routes/webhooks.py), not a timestamp freshness window — Nomba's
+  own docs don't implement one either.
 """
+import base64
 import hashlib
 import hmac
 from dataclasses import dataclass
@@ -89,26 +88,62 @@ def _safe_get(d: dict, *path, default=None):
     return cur
 
 
+def _build_signing_string(payload: dict, timestamp: str) -> str:
+    """Builds the exact colon-joined string Nomba signs, per their
+    dedicated Webhooks reference doc. Missing fields become empty
+    strings — the colon separators are always present, so field
+    positions never shift."""
+    merchant = _safe_get(payload, "data", "merchant") or {}
+    transaction = _safe_get(payload, "data", "transaction") or {}
+    fields = [
+        payload.get("event_type") or payload.get("event") or "",
+        payload.get("requestId") or "",
+        merchant.get("userId") or "",
+        merchant.get("walletId") or "",
+        transaction.get("transactionId") or "",
+        transaction.get("type") or "",
+        transaction.get("time") or "",
+        transaction.get("responseCode") or "",
+        timestamp or "",
+    ]
+    return ":".join(str(f) for f in fields)
+
+
 def verify_signature(
-    raw_body: bytes,
+    payload: dict,
     headers: dict,
     secret: str,
     signature_header: str = "nomba-signature",
+    timestamp_header: str = "nomba-timestamp",
 ) -> None:
     """
     Raises SignatureVerificationError on any failure. Returns nothing —
-    a clean return means the signature is valid. Must be called with
-    the RAW bytes exactly as received, before any JSON parsing.
+    a clean return means the signature is valid.
+
+    Must be called with the already-JSON-parsed payload, not raw
+    bytes — the signed string is built from specific parsed fields
+    plus the nomba-timestamp header value, per Nomba's real scheme
+    (see module docstring). This means JSON parsing has to happen
+    before verification now, unlike a raw-body HMAC scheme.
     """
     headers = {k.lower(): v for k, v in headers.items()}
     received_signature = headers.get(signature_header.lower())
+    timestamp = headers.get(timestamp_header.lower())
 
     if not received_signature:
         raise SignatureVerificationError("missing signature header")
+    if not timestamp:
+        raise SignatureVerificationError("missing timestamp header")
     if not secret:
         raise SignatureVerificationError("server misconfigured: no webhook secret set")
 
-    expected = hmac.new(key=secret.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256).hexdigest()
+    signing_string = _build_signing_string(payload, timestamp)
+    digest = hmac.new(
+        key=secret.encode("utf-8"),
+        msg=signing_string.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
 
     if not hmac.compare_digest(expected, received_signature):
         raise SignatureVerificationError("signature mismatch")

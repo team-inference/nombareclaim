@@ -126,14 +126,26 @@ async def receive_nomba_webhook(
     db: Session = Depends(get_db),
 ):
     raw_body = await request.body()
-
     headers = dict(request.headers)
+
+    # CORRECTED: Nomba's real signature scheme signs specific fields
+    # from the PARSED payload plus the nomba-timestamp header value —
+    # not a hash of the raw body (see services/signature.py). That
+    # means JSON parsing now has to happen before signature
+    # verification, the reverse of the previous (incorrect) ordering.
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        logger.warning("rejected webhook: invalid JSON body")
+        return JSONResponse(status_code=400, content={"detail": "invalid JSON"})
+
     try:
         verify_signature(
-            raw_body=raw_body,
+            payload=payload,
             headers=headers,
             secret=settings.NOMBA_WEBHOOK_SIGNATURE_KEY,
             signature_header=settings.NOMBA_SIGNATURE_HEADER,
+            timestamp_header=settings.NOMBA_TIMESTAMP_HEADER,
         )
     except SignatureVerificationError as e:
         # Do not leak details of *why* verification failed beyond a
@@ -141,12 +153,6 @@ async def receive_nomba_webhook(
         # signature or the signing key.
         logger.warning("rejected webhook: signature verification failed (%s)", str(e))
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-
-    try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        logger.warning("rejected webhook: invalid JSON body")
-        return JSONResponse(status_code=400, content={"detail": "invalid JSON"})
 
     verified = extract_event(payload)
 

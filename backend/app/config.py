@@ -42,6 +42,13 @@ class Settings:
     NOMBA_WEBHOOK_SIGNATURE_KEY: str = os.getenv("NOMBA_WEBHOOK_SIGNATURE_KEY", "")
     NOMBA_SIGNATURE_HEADER: str = os.getenv("NOMBA_SIGNATURE_HEADER", "nomba-signature")
 
+    # CORRECTED against Nomba's actual dedicated Webhooks reference doc
+    # (developer.nomba.com/docs/api-basics/webhook): the signature is
+    # NOT a hash of the raw body. It's HMAC-SHA256, Base64-encoded,
+    # over a colon-joined string of specific fields plus this
+    # timestamp header's value. See services/signature.py.
+    NOMBA_TIMESTAMP_HEADER: str = os.getenv("NOMBA_TIMESTAMP_HEADER", "nomba-timestamp")
+
     # --- AI ---
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")

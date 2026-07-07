@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -12,6 +13,7 @@ init_db()  # ensure tables exist (equivalent to FastAPI's startup event)
 client = TestClient(app)
 
 SIGNATURE_KEY = "test_webhook_secret_123"
+TIMESTAMP = "1751500000"
 
 PAYLOAD = {
     "event_type": "payment_failed",
@@ -30,9 +32,37 @@ PAYLOAD = {
 }
 
 
-def _signed_headers(raw_body: bytes) -> dict:
-    sig = hmac.new(SIGNATURE_KEY.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return {"nomba-signature": sig, "Content-Type": "application/json"}
+def _sign(payload: dict, timestamp: str = TIMESTAMP, secret: str = SIGNATURE_KEY) -> str:
+    """Matches Nomba's real documented scheme (see services/signature.py):
+    HMAC-SHA256, Base64-encoded, over a colon-joined string of specific
+    parsed fields plus the nomba-timestamp header value — NOT a hash of
+    the raw body."""
+    data = payload.get("data", {}) or {}
+    merchant = data.get("merchant", {}) or {}
+    transaction = data.get("transaction", {}) or {}
+    signing_string = ":".join(
+        [
+            payload.get("event_type", "") or "",
+            payload.get("requestId", "") or "",
+            merchant.get("userId", "") or "",
+            merchant.get("walletId", "") or "",
+            transaction.get("transactionId", "") or "",
+            transaction.get("type", "") or "",
+            transaction.get("time", "") or "",
+            transaction.get("responseCode", "") or "",
+            timestamp,
+        ]
+    )
+    digest = hmac.new(secret.encode("utf-8"), signing_string.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _signed_headers(payload: dict, timestamp: str = TIMESTAMP) -> dict:
+    return {
+        "nomba-signature": _sign(payload, timestamp),
+        "nomba-timestamp": timestamp,
+        "Content-Type": "application/json",
+    }
 
 
 def test_health():
@@ -47,22 +77,23 @@ def test_unsigned_webhook_returns_401_and_does_not_crash():
 
 
 def test_malformed_json_returns_400_not_500():
-    # A malformed body still needs a VALID signature to get past
-    # verification first (verification now happens before JSON
-    # parsing) — sign the malformed bytes themselves, then confirm the
-    # JSON parse step is what correctly rejects it with 400.
+    # CORRECTED ordering: JSON parsing now happens BEFORE signature
+    # verification (Nomba's real scheme signs fields from the parsed
+    # payload, so there's no way to verify a signature against a body
+    # that doesn't even parse). A malformed body should 400 on the
+    # parse step regardless of what headers are sent.
     bad_body = b"{not valid json"
     resp = client.post(
         "/webhooks/nomba",
         content=bad_body,
-        headers=_signed_headers(bad_body),
+        headers={"nomba-signature": "irrelevant", "nomba-timestamp": TIMESTAMP},
     )
     assert resp.status_code == 400
 
 
 def test_valid_signed_webhook_is_accepted_and_stored():
     raw_body = json.dumps(PAYLOAD).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(PAYLOAD))
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "received"
@@ -76,7 +107,7 @@ def test_valid_signed_webhook_is_accepted_and_stored():
 
 def test_duplicate_delivery_is_not_reprocessed():
     raw_body = json.dumps(PAYLOAD).encode("utf-8")
-    headers = _signed_headers(raw_body)
+    headers = _signed_headers(PAYLOAD)
 
     first = client.post("/webhooks/nomba", content=raw_body, headers=headers)
     assert first.status_code == 200
@@ -122,7 +153,7 @@ def test_uppercase_event_type_is_accepted_same_as_lowercase():
         },
     }
     raw_body = json.dumps(uppercase_payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(uppercase_payload))
     assert resp.status_code == 200
     assert resp.json()["status"] == "received"
 
@@ -143,7 +174,7 @@ def test_confirmed_flat_payload_shape_converts_kobo_to_naira():
         },
     }
     raw_body = json.dumps(flat_payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(raw_body))
+    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(flat_payload))
     assert resp.status_code == 200
     event_id = resp.json()["id"]
 
