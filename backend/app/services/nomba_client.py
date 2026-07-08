@@ -41,17 +41,24 @@ seemed at the time. Several things below were corrected as a result:
    not shown with its own full example — worth confirming against a
    real production transaction if this ever goes live).
 
-5. Checkout amounts: still sent as INTEGER KOBO here (the
-   training-quiz convention), NOT changed to match the official
-   sandbox-testing doc's example, which oddly shows a DECIMAL STRING
-   ("400000.00") for the same value. This is a genuine, unresolved
-   conflict between two real doc sources on wire format for the
-   REQUEST body specifically (separate from the webhook AMOUNT UNIT
-   conflict already handled in routes/webhooks.py's
-   _resolve_amount_naira). Kept as integer kobo since that's what
-   this client already sends successfully-shaped requests with; if a
-   real sandbox checkout creation call fails with a format complaint,
-   try the decimal-string-kobo variant next, in that order.
+5. Checkout REQUEST amount format corrected: sent as a DECIMAL STRING
+   ("400000.00" style), matching the official sandbox-testing doc's
+   real checkout-creation example, not the plain integer this client
+   previously sent. An earlier version of this docstring called this
+   "a genuine, unresolved conflict" between two doc sources — that
+   was overstated. The training quiz's `amount: 250000` (integer) is
+   from a WEBHOOK PAYLOAD (something Nomba sends us); the
+   sandbox-testing doc's `"amount": "400000.00"` (string) is from a
+   CHECKOUT ORDER CREATION REQUEST (something we send to Nomba).
+   These are two different API surfaces, not necessarily the same
+   wire format at all — a REST API sending decimal strings in
+   requests while reporting plain integers in webhooks/responses is
+   ordinary API design, not a contradiction. For this specific call,
+   the only confirmed real example for THIS exact endpoint uses a
+   decimal string, so that's what's sent — not a guess "kept as
+   integer because it hasn't failed yet" (this client had not, in
+   fact, been confirmed to succeed against a real sandbox checkout
+   creation call at the time that claim was written).
 
 Confirmed shapes (now cross-checked against the official
 developer.nomba.com sandbox-testing doc):
@@ -168,8 +175,13 @@ async def _auth_headers() -> dict:
     }
 
 
-def _naira_to_kobo(amount_naira: int) -> int:
-    return round(amount_naira * 100)
+def _naira_to_kobo(amount_naira: int) -> str:
+    """Returns a decimal-string kobo value ("400000.00" style),
+    matching the official sandbox-testing doc's real checkout-creation
+    example exactly — see module docstring point 5 for why this is a
+    string and not the plain integer an earlier version sent."""
+    kobo = round(amount_naira * 100)
+    return f"{kobo}.00"
 
 
 def _kobo_to_naira(amount_kobo) -> int:

@@ -270,15 +270,19 @@ corrected a second time:
   separate fields for exactly this reason; `routes/webhooks.py`'s
   `_resolve_amount_naira()` prefers the confirmed-naira value when
   present, falling back to the kobo conversion only when it's absent.
-- **A separate, still-unresolved conflict on amount units for the
-  REQUEST body specifically** (different from the webhook conflict
-  above): the official sandbox-testing doc's checkout-creation
-  example sends `"amount": "400000.00"` — a DECIMAL STRING — while
-  this client still sends an INTEGER (`250000`), matching the
-  training quiz's convention. Not changed without a live test to
-  confirm which format the real API actually accepts; if a real
-  sandbox checkout creation call fails with a format complaint, try
-  the decimal-string variant next.
+- **RESOLVED: checkout REQUEST body amount format.** The official
+  sandbox-testing doc's checkout-creation example sends
+  `"amount": "400000.00"` — a decimal STRING. An earlier version of
+  this document called this "a genuine, unresolved conflict" against
+  the training quiz's `amount: 250000` (a plain integer) and left the
+  request sending a bare integer without changing it. That framing
+  was overstated: the training quiz's example is from a WEBHOOK
+  PAYLOAD (something Nomba sends us), while the sandbox-testing
+  example is from a CHECKOUT ORDER CREATION REQUEST (something we
+  send to Nomba) — two different API surfaces, not necessarily the
+  same wire format. `_naira_to_kobo()` now sends the decimal-string
+  format, matching the only confirmed real example for this specific
+  endpoint's request body.
 - **Recovery confirmation now matches on the correct field.**
   `data.order.orderReference` is confirmed to be exactly the value
   this system itself sets as `orderReference` when creating a
