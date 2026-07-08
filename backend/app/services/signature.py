@@ -1,42 +1,62 @@
 """
 Nomba webhook signature verification.
 
-CORRECTION (second pass) — the previous version of this file, and the
-"sandbox-testing" doc it was checked against, both assumed a plain
-HMAC-SHA256-hex over the RAW request body. That is wrong. Nomba's own
-dedicated Webhooks reference doc
-(developer.nomba.com/docs/api-basics/webhook) gives the actual
-reference implementation, and it's a completely different scheme:
+CRITICAL CORRECTION — everything in this file was previously built
+against an assumption that turned out to be wrong in a way that would
+have silently rejected every single real Nomba webhook. Nomba's real,
+official developer docs (developer.nomba.com/docs/api-basics/webhook)
+confirm the actual signature algorithm, with real reference
+implementations in six languages (Go, Python, JS, Java, C#, PHP) that
+all agree on the same construction:
 
-- NOT a hash of the raw body. Instead, a colon-joined string built
-  from specific fields pulled out of the ALREADY-PARSED payload, in
-  this exact order:
-    event_type : requestId : data.merchant.userId :
-    data.merchant.walletId : data.transaction.transactionId :
-    data.transaction.type : data.transaction.time :
-    data.transaction.responseCode : <nomba-timestamp header value>
-  Any missing field is treated as an empty string, not omitted — the
-  colon separators still all appear.
-- HMAC-SHA256 over that string, then **Base64-encoded** — not hex.
-- Compared against the `nomba-signature` header, case-insensitively,
-  using `hmac.compare_digest`.
-- The `nomba-timestamp` header is not optional or advisory — its
-  value is one of the fields actually hashed. A request missing that
-  header can never produce a matching signature and must be rejected.
+    hashing_payload = f"{event_type}:{request_id}:{user_id}:{wallet_id}:"
+                       f"{transaction_id}:{transaction_type}:{transaction_time}:"
+                       f"{transaction_response_code}:{timestamp}"
 
-Practical consequence: since the fields being signed come from the
-parsed payload, JSON parsing must now happen BEFORE signature
-verification (previously the reverse, when we were hashing raw
-bytes). See app/routes/webhooks.py for the updated ordering.
+    signature = base64.b64encode(
+        hmac.new(secret.encode(), hashing_payload.encode(), hashlib.sha256).digest()
+    ).decode()
 
-Still true and unchanged:
-- Replay protection is via `event.requestId` idempotency (see
-  app/routes/webhooks.py), not a timestamp freshness window — Nomba's
-  own docs don't implement one either.
+Two things this corrects, both load-bearing:
+
+1. The signature is NOT a hash of the raw request body. It's a hash of
+   NINE specific fields joined by colons — event_type, requestId,
+   merchant.userId, merchant.walletId, transaction.transactionId,
+   transaction.type, transaction.time, transaction.responseCode (empty
+   string if missing or literally the string "null"), and the
+   `nomba-timestamp` HEADER value (not from the payload). An earlier
+   version of this file computed HMAC over the raw body — that
+   construction produces a completely different signature and would
+   reject every genuine webhook as a signature mismatch.
+
+2. The signature is BASE64-encoded, not hex. An earlier version used
+   `.hexdigest()`. Even with the correct hashing input, comparing a
+   hex string against Nomba's base64 signature would never match.
+
+Practically: this means signature verification cannot happen purely
+on raw, unparsed bytes anymore — it requires the same field extraction
+that extract_event() already does for business logic, run once,
+before any 401 decision is made. This file's verify_signature() now
+takes the parsed payload dict and the request headers directly, and
+is called with the already-parsed payload in routes/webhooks.py's
+webhook handler.
+
+Also corrected: there are FIVE Nomba-specific headers, not one —
+`nomba-signature`, `nomba-sig-value` (documented with the same value
+in the reference example — kept as a fallback source for the
+signature if the primary header is absent), `nomba-signature-algorithm`
+(always `HmacSHA256`), `nomba-signature-version` (`1.0.0` currently),
+and `nomba-timestamp` (RFC-3339, and — critically — an actual input to
+the hash itself, not just informational).
+
+Replay protection remains via `requestId` idempotency (see
+routes/webhooks.py), consistent with how Nomba's own docs discuss
+duplicate webhook delivery (their retry policy resends the same
+`requestId` up to five times on a non-2xx response).
 """
-import base64
 import hashlib
 import hmac
+import base64
 from dataclasses import dataclass
 from typing import Optional
 
@@ -88,25 +108,18 @@ def _safe_get(d: dict, *path, default=None):
     return cur
 
 
-def _build_signing_string(payload: dict, timestamp: str) -> str:
-    """Builds the exact colon-joined string Nomba signs, per their
-    dedicated Webhooks reference doc. Missing fields become empty
-    strings — the colon separators are always present, so field
-    positions never shift."""
-    merchant = _safe_get(payload, "data", "merchant") or {}
-    transaction = _safe_get(payload, "data", "transaction") or {}
-    fields = [
-        payload.get("event_type") or payload.get("event") or "",
-        payload.get("requestId") or "",
-        merchant.get("userId") or "",
-        merchant.get("walletId") or "",
-        transaction.get("transactionId") or "",
-        transaction.get("type") or "",
-        transaction.get("time") or "",
-        transaction.get("responseCode") or "",
-        timestamp or "",
-    ]
-    return ":".join(str(f) for f in fields)
+def _normalize_response_code(value) -> str:
+    """The official reference implementations explicitly check for the
+    LITERAL STRING "null" (not just Python/JS null/None) and normalize
+    it to an empty string before hashing — a quirk of whatever
+    serializes the value on Nomba's side. Mirrored here exactly, since
+    getting this wrong means every failure event with no response code
+    would fail signature verification."""
+    if value is None:
+        return ""
+    if str(value).lower() == "null":
+        return ""
+    return str(value)
 
 
 def verify_signature(
@@ -120,30 +133,44 @@ def verify_signature(
     Raises SignatureVerificationError on any failure. Returns nothing —
     a clean return means the signature is valid.
 
-    Must be called with the already-JSON-parsed payload, not raw
-    bytes — the signed string is built from specific parsed fields
-    plus the nomba-timestamp header value, per Nomba's real scheme
-    (see module docstring). This means JSON parsing has to happen
-    before verification now, unlike a raw-body HMAC scheme.
+    Takes the PARSED payload (not raw bytes) plus request headers,
+    per the confirmed real algorithm — see module docstring. Must be
+    called after JSON parsing, unlike the raw-body approach this
+    replaced.
     """
     headers = {k.lower(): v for k, v in headers.items()}
-    received_signature = headers.get(signature_header.lower())
+    received_signature = headers.get(signature_header.lower()) or headers.get("nomba-sig-value")
     timestamp = headers.get(timestamp_header.lower())
 
     if not received_signature:
         raise SignatureVerificationError("missing signature header")
     if not timestamp:
-        raise SignatureVerificationError("missing timestamp header")
+        raise SignatureVerificationError("missing nomba-timestamp header")
     if not secret:
         raise SignatureVerificationError("server misconfigured: no webhook secret set")
 
-    signing_string = _build_signing_string(payload, timestamp)
-    digest = hmac.new(
-        key=secret.encode("utf-8"),
-        msg=signing_string.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).digest()
-    expected = base64.b64encode(digest).decode("utf-8")
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    merchant = data.get("merchant", {}) if isinstance(data, dict) else {}
+    transaction = data.get("transaction", {}) if isinstance(data, dict) else {}
+
+    event_type = payload.get("event_type") or payload.get("event") or ""
+    request_id = payload.get("requestId", "")
+    user_id = merchant.get("userId", "") or ""
+    wallet_id = merchant.get("walletId", "") or ""
+    transaction_id = transaction.get("transactionId", "") or ""
+    transaction_type = transaction.get("type", "") or ""
+    transaction_time = transaction.get("time", "") or ""
+    transaction_response_code = _normalize_response_code(transaction.get("responseCode"))
+
+    hashing_payload = (
+        f"{event_type}:{request_id}:{user_id}:{wallet_id}:"
+        f"{transaction_id}:{transaction_type}:{transaction_time}:"
+        f"{transaction_response_code}:{timestamp}"
+    )
+
+    expected = base64.b64encode(
+        hmac.new(secret.encode("utf-8"), hashing_payload.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
 
     if not hmac.compare_digest(expected, received_signature):
         raise SignatureVerificationError("signature mismatch")
@@ -151,9 +178,13 @@ def verify_signature(
 
 def extract_event(payload: dict) -> ParsedEvent:
     """Pulls the fields this system needs out of an already-verified,
-    already-JSON-parsed payload. Kept separate from verify_signature()
-    since verification must happen on raw bytes, while field extraction
-    naturally happens on the parsed dict afterwards.
+    already-JSON-parsed payload. verify_signature() above does its own
+    minimal, independent extraction of the specific fields the HMAC
+    needs (event_type, requestId, merchant.userId/walletId,
+    transaction.transactionId/type/time/responseCode) — this function
+    extracts the broader set of fields the rest of the business logic
+    needs, including the order/customer fields the signature
+    calculation doesn't touch at all.
 
     THREE payload shapes are checked now, in confirmation order:
 

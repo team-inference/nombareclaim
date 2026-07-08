@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import hmac
-import json
 
 from fastapi.testclient import TestClient
 
@@ -13,36 +12,30 @@ init_db()
 client = TestClient(app)
 
 SIGNATURE_KEY = "test_webhook_secret_123"
-TIMESTAMP = "1751500000"
+TIMESTAMP = "2026-06-30T10:00:00Z"
 
 
-def _sign(payload: dict, timestamp: str = TIMESTAMP) -> str:
-    """Matches Nomba's real documented scheme (see services/signature.py):
-    HMAC-SHA256, Base64-encoded, over specific parsed fields plus the
-    nomba-timestamp header value — NOT a hash of the raw body."""
-    data = payload.get("data", {}) or {}
-    merchant = data.get("merchant", {}) or {}
-    transaction = data.get("transaction", {}) or {}
-    signing_string = ":".join(
-        [
-            payload.get("event_type", "") or "",
-            payload.get("requestId", "") or "",
-            merchant.get("userId", "") or "",
-            merchant.get("walletId", "") or "",
-            transaction.get("transactionId", "") or "",
-            transaction.get("type", "") or "",
-            transaction.get("time", "") or "",
-            transaction.get("responseCode", "") or "",
-            timestamp,
-        ]
+def _sign_payload(payload: dict, timestamp: str = TIMESTAMP, secret: str = SIGNATURE_KEY) -> str:
+    data = payload.get("data", {})
+    merchant = data.get("merchant", {})
+    transaction = data.get("transaction", {})
+    response_code = transaction.get("responseCode") or ""
+    if str(response_code).lower() == "null":
+        response_code = ""
+
+    hashing_payload = (
+        f"{payload.get('event_type', '')}:{payload.get('requestId', '')}:"
+        f"{merchant.get('userId', '')}:{merchant.get('walletId', '')}:"
+        f"{transaction.get('transactionId', '')}:{transaction.get('type', '')}:"
+        f"{transaction.get('time', '')}:{response_code}:{timestamp}"
     )
-    digest = hmac.new(SIGNATURE_KEY.encode("utf-8"), signing_string.encode("utf-8"), hashlib.sha256).digest()
+    digest = hmac.new(secret.encode("utf-8"), hashing_payload.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("utf-8")
 
 
 def _signed_headers(payload: dict, timestamp: str = TIMESTAMP) -> dict:
     return {
-        "nomba-signature": _sign(payload, timestamp),
+        "nomba-signature": _sign_payload(payload, timestamp),
         "nomba-timestamp": timestamp,
         "Content-Type": "application/json",
     }
@@ -59,8 +52,7 @@ def _post_failure(request_id: str, transaction_id: str, response_code: str, amou
             "transaction": {"responseCode": response_code},
         },
     }
-    raw_body = json.dumps(payload).encode("utf-8")
-    resp = client.post("/webhooks/nomba", content=raw_body, headers=_signed_headers(payload))
+    resp = client.post("/webhooks/nomba", json=payload, headers=_signed_headers(payload))
     assert resp.status_code == 200
     return resp.json()["id"]
 

@@ -38,38 +38,61 @@ variables, never committed — see section 6.
 Every inbound request to `/webhooks/nomba` is verified before any
 business logic runs, in `app/services/signature.py`.
 
-**This section is now confirmed against Nomba's own official training
-documentation** (training.nomba.com > Webhooks module), not inferred —
-an earlier draft of this system had to guess at parts of this scheme;
-that guess has since been replaced with their documented reference
-implementation, matched exactly.
+**CRITICAL CORRECTION, discovered during live debugging on the final
+submission day**: this section previously described an algorithm
+confirmed against Nomba's training-certification quiz
+(training.nomba.com). That algorithm was wrong in a way that would
+have silently rejected every single real Nomba webhook as a signature
+mismatch, disguised as an ordinary-looking `401`. It was caught before
+causing real damage only because reachability was independently
+verified first (a manual test webhook correctly returned `401` for a
+*missing* signature — which looked like confirmation the system worked,
+but never actually exercised the *matching* logic against a real
+signature). Nomba's real, official developer docs
+(developer.nomba.com/docs/api-basics/webhook) — which include full
+reference implementations in Go, Python, JavaScript, Java, C#, and
+PHP, all agreeing with each other — reveal the actual algorithm:
 
-- **Algorithm**: HMAC-SHA256, hex-encoded.
-- **What's hashed**: the raw, unparsed request body bytes — exactly as
-  received, before any JSON parsing happens. This matters: hashing a
-  re-serialized version of the parsed JSON can produce a different
-  byte sequence than what was actually sent (whitespace, key
-  ordering), which would make a genuinely valid signature look
-  invalid. The raw body is captured first and signature verification
-  runs against those exact bytes; JSON parsing only happens afterward,
-  once the signature has already passed.
-- **Where the signature lives**: a single request header,
-  `nomba-signature`, compared against the locally-computed digest.
-  Nomba's own sample code confirms this is the only header involved —
-  there is no separate timestamp header in their scheme.
-- **The secret**: referred to in this codebase as
-  `NOMBA_WEBHOOK_SIGNATURE_KEY`, matching what Nomba calls
-  `NOMBA_WEBHOOK_SECRET` in their own sample — the secret Nomba
-  generates when you register a webhook URL on their dashboard.
+- **Algorithm**: HMAC-SHA256, **base64-encoded** (not hex).
+- **What's hashed**: NOT the raw request body. A colon-joined string
+  of nine specific fields:
+  ```
+  {event_type}:{requestId}:{merchant.userId}:{merchant.walletId}:
+  {transaction.transactionId}:{transaction.type}:{transaction.time}:
+  {transaction.responseCode}:{nomba-timestamp header value}
+  ```
+  `transaction.responseCode` is normalized to an empty string if it's
+  missing or literally the string `"null"` (a quirk of Nomba's own
+  serialization, mirrored exactly — see
+  `signature.py::_normalize_response_code`). Because the hash depends
+  on parsed fields rather than raw bytes, JSON parsing must now happen
+  **before** signature verification, the reverse of the previous
+  order.
+- **Where the signature lives**: `nomba-signature` (falls back to
+  `nomba-sig-value`, shown with an identical example value in the
+  official docs). There are actually FIVE Nomba-specific headers, not
+  one: the two above, plus `nomba-signature-algorithm`
+  (`HmacSHA256`), `nomba-signature-version` (`1.0.0`), and
+  `nomba-timestamp` — which is not just informational, it's a literal
+  **input to the hash**, read via the (previously unused) env var
+  `NOMBA_TIMESTAMP_HEADER`.
+- **The secret**: `NOMBA_WEBHOOK_SIGNATURE_KEY`, the secret Nomba
+  generates when a webhook URL is registered.
 - **Comparison**: `hmac.compare_digest`, never `==`, to avoid leaking
   timing information about how many bytes of a forged signature were
   correct.
 - **Failure mode**: any verification failure (bad signature, missing
-  header) returns `401` immediately. The response body never echoes
-  the computed or expected signature, the signing key, or *why
-  specifically* verification failed beyond a generic reason — an
-  attacker probing the endpoint learns nothing useful from a failed
-  attempt.
+  signature header, missing timestamp header) returns `401`
+  immediately. The response body never echoes the computed or
+  expected signature, the signing key, or *why specifically*
+  verification failed beyond a generic reason.
+
+This is documented in detail, including a full citation and worked
+example, in `services/signature.py`'s module docstring —
+`test_signature.py::test_signature_matches_nomba_documented_scheme_exactly`
+proves this implementation produces byte-for-byte the same signature
+as an independent reference built directly from Nomba's own published
+sample code, not copied from this file.
 
 ## 3. Replay protection
 
@@ -264,17 +287,22 @@ corrected a second time:
   `transaction_id` instead, which was never actually the right field
   for this purpose — kept as a fallback only for payloads without a
   separate `order` object.
-- **Still genuinely open, not resolved by any source seen so far**:
-  the official doc's confirmed example is for `payment_success` — it
-  does not show a failed-payment example at all, so the real event
-  name for a failed payment remains unconfirmed by ANY source, official
-  doc or training quiz. Confirm it by triggering a real sandbox
-  failure with the official doc's documented decline test card
-  (`5484497218317651`, "do not honor" response) and inspecting what
-  actually arrives, or by asking Nomba/DevCareer directly what event
-  name their webhook-forwarding for this hackathon actually sends —
-  see section 16 below, this is exactly what blocked visible dashboard
-  data for a period during the build.
+- **RESOLVED**: the real event name for a failed payment is confirmed
+  as `payment_failed` (lowercase, underscore) — found in a second
+  official doc page (developer.nomba.com/docs/api-basics/webhook),
+  distinct from the sandbox-testing page that only showed a
+  `payment_success` example. The confirmed example is a POS-originated
+  purchase (`data.transaction.responseCodeMessage: "Insufficient
+  Funds"`, `responseCode: "51"`) rather than an online-checkout
+  failure specifically, so it doesn't confirm whether `data.order.*`
+  (including `customerEmail`) is present on a failed *checkout*
+  specifically the way it's confirmed present on a successful one —
+  that narrower point is the one thing about payload shape still
+  worth checking against a real sandbox test, not the event name
+  itself, which is settled. Matching in `NOMBA_FAILURE_EVENT_TYPES`
+  already handled this correctly via case-insensitive matching before
+  this was even confirmed, since the default value `PAYMENT_FAILED`
+  normalizes to the same uppercase form either way.
 - Also corrected: the earlier claim that there is exactly ONE webhook
   header and no timestamp header at all was itself wrong — the
   official doc's signature section lists FOUR headers
@@ -480,3 +508,49 @@ reference are not the same category of source, even when both claim
 official status, and a live DNS/connectivity failure is worth treating
 as a signal to re-verify assumptions rather than just a networking
 inconvenience to work around.
+
+## 17. A second, more serious correction: the signature algorithm itself
+
+Everything in section 16 concerned the sandbox host and checkout API
+shape. A second, more serious problem was found afterward, in the same
+final debugging session: the HMAC signature algorithm this system
+implemented — hashing the raw request body, hex-encoded — was
+confirmed wrong against `developer.nomba.com/docs/api-basics/webhook`'s
+actual reference implementations. The real algorithm hashes nine
+specific parsed fields (not the raw body) and base64-encodes the
+result (not hex) — see section 2 for the corrected algorithm in full.
+
+This is a materially more dangerous class of bug than the sandbox-host
+typo: a wrong hostname fails loudly and immediately (DNS resolution
+error, impossible to miss). A wrong signature algorithm fails
+*quietly* — every legitimate webhook would have been rejected with an
+ordinary-looking `401 signature mismatch`, indistinguishable in the
+logs from an actual forged request, and easy to misread as "Nomba
+still isn't sending us anything" rather than "we're rejecting
+everything they send." It was caught only because an unsigned test
+request (confirming the endpoint was reachable and returned 401 for a
+*missing* signature) was mistaken for stronger evidence than it
+actually was — that test never exercised the signature-matching logic
+at all. The general lesson: confirm a security check rejects bad input
+for the *right* reason, not just that it rejects *something*.
+
+## 18. Self-service webhook diagnostics (Nomba's REST API)
+
+Nomba exposes a REST API for inspecting and replaying webhook delivery
+history directly — `developer.nomba.com/docs/api-basics/
+troubleshoot-webhooks` — which is a faster diagnostic path than
+waiting on hackathon support for "did you actually send us anything":
+
+- **List delivered webhook events** for an account/date range/event
+  type, to see directly whether Nomba attempted delivery at all,
+  independent of anything in this system's own logs.
+- **Re-push a specific event** by ID, or **replay a whole date range**,
+  to manually trigger redelivery of a real event to the registered
+  URL — useful for testing the full pipeline end-to-end without
+  waiting for a new failure to occur naturally.
+
+This wasn't wired into NombaReclaim itself (it's a diagnostic tool for
+developers, not something a merchant-facing recovery engine needs to
+call), but it's the correct next step for confirming, independent of
+any Slack conversation, whether webhook forwarding is actually active
+for this project's sub-account.

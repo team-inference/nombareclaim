@@ -41,12 +41,13 @@ class Settings:
     # Nomba's own docs recommend.
     NOMBA_WEBHOOK_SIGNATURE_KEY: str = os.getenv("NOMBA_WEBHOOK_SIGNATURE_KEY", "")
     NOMBA_SIGNATURE_HEADER: str = os.getenv("NOMBA_SIGNATURE_HEADER", "nomba-signature")
-
-    # CORRECTED against Nomba's actual dedicated Webhooks reference doc
-    # (developer.nomba.com/docs/api-basics/webhook): the signature is
-    # NOT a hash of the raw body. It's HMAC-SHA256, Base64-encoded,
-    # over a colon-joined string of specific fields plus this
-    # timestamp header's value. See services/signature.py.
+    # CORRECTED: this was previously an unused/"dead" variable — an
+    # earlier version of this system believed (incorrectly) that
+    # Nomba's signature scheme had no timestamp header at all. It's
+    # confirmed now, per developer.nomba.com's real webhook docs, that
+    # nomba-timestamp is not just present but an actual INPUT to the
+    # HMAC calculation itself (see services/signature.py). This
+    # variable is now genuinely read and used.
     NOMBA_TIMESTAMP_HEADER: str = os.getenv("NOMBA_TIMESTAMP_HEADER", "nomba-timestamp")
 
     # --- AI ---

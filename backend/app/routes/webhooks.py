@@ -31,15 +31,17 @@ router = APIRouter()
 # uncertainty about field name/casing in favor of "event_type", though
 # matching here still stays case-insensitive as cheap extra safety.
 #
-# STILL genuinely unresolved: the official doc's example is for
-# payment_success — it does not show a failed-payment example at all,
-# so the real event name for a failed payment remains unconfirmed by
-# ANY source seen so far, official or training quiz. Confirm it by
-# triggering a real sandbox failure with the documented "do not honor"
-# decline test card (5484497218317651 per the official sandbox-testing
-# doc) and inspecting what actually arrives, or by asking Nomba/
-# DevCareer directly what event name their webhook-forwarding for this
-# hackathon actually sends.
+# RESOLVED: the real event name for a failed payment is confirmed as
+# `payment_failed` (lowercase, underscore), found in
+# developer.nomba.com/docs/api-basics/webhook — a second official doc
+# page distinct from the sandbox-testing page that only showed a
+# payment_success example. Matching here is case-insensitive regardless
+# (see _normalize_event_type below), so this was already handled
+# correctly even before the exact casing was confirmed. Still
+# genuinely worth checking against a real sandbox test: whether an
+# ONLINE CHECKOUT failure specifically (as opposed to the confirmed
+# example, a POS-originated purchase) includes the same data.order.*
+# fields — including customerEmail — that a successful checkout does.
 
 
 def _normalize_event_type(event_type: str) -> str:
@@ -128,11 +130,11 @@ async def receive_nomba_webhook(
     raw_body = await request.body()
     headers = dict(request.headers)
 
-    # CORRECTED: Nomba's real signature scheme signs specific fields
-    # from the PARSED payload plus the nomba-timestamp header value —
-    # not a hash of the raw body (see services/signature.py). That
-    # means JSON parsing now has to happen before signature
-    # verification, the reverse of the previous (incorrect) ordering.
+    # CORRECTED ORDER: the real signature algorithm (see
+    # services/signature.py's module docstring) hashes specific parsed
+    # fields plus the nomba-timestamp header — not the raw body — so
+    # JSON must be parsed BEFORE signature verification can happen at
+    # all now, the reverse of this system's earlier raw-body approach.
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:

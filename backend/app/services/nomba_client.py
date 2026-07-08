@@ -80,32 +80,11 @@ developer.nomba.com sandbox-testing doc):
   `data.message` / `data.transactionDetails.statusCode` (text status).
 """
 import time
-from datetime import datetime
 from typing import Optional
 
 import httpx
 
 from app.config import settings
-
-
-def _parse_expires_at(value) -> Optional[float]:
-    """
-    CORRECTED: Nomba's real token-issue response uses an absolute ISO
-    8601 timestamp field `expiresAt` (e.g. "2026-07-07T15:30:00Z"),
-    not a duration-in-seconds `expires_in` field. The previous version
-    of this client only ever looked for `expires_in`, never found it,
-    and silently always fell back to the hardcoded 3600s assumption.
-    Harmless today since ~60min matches the documented token
-    lifetime, but it means the real field was never actually being
-    read. Returns a unix timestamp, or None if `value` is missing/
-    unparseable so the caller can fall back safely.
-    """
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except (ValueError, TypeError):
-        return None
 
 
 class NombaAPIError(Exception):
@@ -172,18 +151,11 @@ async def _get_access_token() -> str:
     if not token:
         raise NombaAPIError(f"token issue response missing access_token: {data}")
 
-    # Prefer the real `expiresAt` (absolute ISO timestamp) field if
-    # present; fall back to the documented ~60-minute assumption
-    # (`expires_in`, or 3600s) only if it's missing/unparseable.
-    expires_at_raw = data.get("expiresAt") or data.get("data", {}).get("expiresAt")
-    parsed_expiry = _parse_expires_at(expires_at_raw)
-
+    # Confirmed: tokens are valid 60 minutes. Fall back to that exact
+    # figure if the response doesn't echo expires_in explicitly.
+    expires_in = data.get("expires_in") or data.get("data", {}).get("expires_in") or 3600
     _token_cache.token = token
-    if parsed_expiry is not None:
-        _token_cache.expires_at = parsed_expiry
-    else:
-        expires_in = data.get("expires_in") or data.get("data", {}).get("expires_in") or 3600
-        _token_cache.expires_at = time.time() + float(expires_in)
+    _token_cache.expires_at = time.time() + float(expires_in)
     return token
 
 
@@ -196,18 +168,8 @@ async def _auth_headers() -> dict:
     }
 
 
-def _naira_to_kobo(amount_naira: int) -> str:
-    """
-    CORRECTED against a real worked example in Nomba's sandbox-testing
-    guide: a checkout order created with "amount": "400000.00" comes
-    back with order.amount / transaction.transactionAmount of
-    4000.00 — exactly divided by 100, confirming the create-order
-    amount is in KOBO. But the example sends it as a DECIMAL STRING,
-    not a bare integer, which is the part this client previously got
-    wrong. Returns e.g. "250000.00" for ₦2,500, not the int 250000.
-    """
-    kobo = round(amount_naira * 100)
-    return f"{kobo:.2f}"
+def _naira_to_kobo(amount_naira: int) -> int:
+    return round(amount_naira * 100)
 
 
 def _kobo_to_naira(amount_kobo) -> int:
