@@ -221,30 +221,39 @@ corrected a second time:
   The real sandbox host, per the official docs, is
   `https://sandbox.nomba.com` — no `api.` subdomain. Production is
   unaffected: `https://api.nomba.com`.
-- **Sandbox checkout endpoints live under a different path prefix
-  entirely** — `/sandbox/checkout/...`, not `/v1/checkout/...`. This
-  isn't just a different host; it's a genuinely different path
-  structure for checkout-specific operations. Auth
-  (`/v1/auth/token/issue`) is NOT affected — same `/v1` prefix in both
-  environments. `app/services/nomba_client.py` now branches on
-  whether `NOMBA_API_BASE_URL` contains "sandbox" to pick the right
-  prefix (`_checkout_path_prefix()`).
+- **Sandbox checkout path — corrected a second time.** A prior
+  correction claimed sandbox checkout endpoints live under a different
+  path prefix, `/sandbox/checkout/...`. That was itself wrong: a team
+  member reproduced a real `404` hitting that exact path against the
+  actual hackathon sandbox, and the hackathon organizer's own
+  "verified endpoints" reference (posted directly in the hackathon
+  Slack) lists only `POST /v1/checkout/order` for checkout, no
+  separate sandbox path. Checkout uses the SAME path,
+  `/v1/checkout/order`, in both sandbox and production — only the
+  HOST differs, same as auth. The environment-branching this earlier
+  correction added to `app/services/nomba_client.py`
+  (`_checkout_path_prefix()`, a modified `_root_host()`) has been
+  removed.
 - **Checkout response field is `checkoutLink`, not `checkoutUrl`** —
   the training quiz's claim that `checkoutUrl` was confirmed was
   itself wrong. The official doc's real example response shows
   `data.checkoutLink`. Both are now accepted defensively
   (`checkoutLink` preferred), in case a real response ever differs
-  from this specific example.
-- **The transaction-verification endpoint is different than
-  previously coded.** Previously: `GET /checkout/order/{orderReference}`
-  (an unconfirmed guess, never actually verified against a real
-  response). Actually, per the official doc:
-  `GET /sandbox/checkout/transaction?idType=orderReference&id={ref}`
-  in sandbox. Response shape is also now confirmed: `data.success`
-  (boolean) and `data.message` / `data.transactionDetails.statusCode`
-  (text, observed value `"PAYMENT SUCCESSFUL"`) — `services/recovery.py`'s
-  `confirm_recovery_if_paid` now checks these as the primary signal,
-  with the earlier guessed field names kept only as a fallback.
+  from this specific example. Independently confirmed a second time
+  by the organizer's own endpoint reference.
+- **The transaction-verification endpoint — corrected a second time.**
+  A prior correction changed this to
+  `GET /sandbox/checkout/transaction?idType=orderReference&id={ref}`,
+  per the official sandbox-testing doc. That's now the one being
+  overridden: the ORIGINAL training material's claim —
+  `GET /checkout/order/{orderReference}` — turns out to be correct
+  after all, independently matched by the organizer's own reference
+  and consistent with the same reproduced `404` above. Two independent
+  sources plus a real error now agree; the differing doc is set aside
+  this time. No confirmed response-body example exists yet for this
+  specific endpoint from any source — `confirm_recovery_if_paid`
+  checks several plausible field names defensively rather than
+  assuming one, on purpose.
 - **Webhook payload shape is nested, with a confirmed `customerEmail`
   field** — `data.transaction.merchantTxRef`,
   `data.transaction.transactionId`, `data.order.orderReference`,

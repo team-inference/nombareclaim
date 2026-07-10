@@ -173,15 +173,20 @@ async def confirm_recovery_if_paid(event: FailureEvent, db: Session) -> FailureE
     note's core principle — a forged or replayed webhook cannot move
     this system's state on its own, only trigger a lookup.
 
-    CORRECTED: the official developer.nomba.com sandbox-testing doc's
-    real "verify a transaction" example confirms the response shape:
-    `data.success` (boolean) and `data.message` /
-    `data.transactionDetails.statusCode` (both text, observed value
-    "PAYMENT SUCCESSFUL"). An earlier version of this function didn't
-    have this confirmed shape and checked several generic guessed
-    field names instead (status/orderStatus/paymentStatus) — those are
-    kept as a fallback only, in case a real response ever differs from
-    this doc's specific example.
+    CORRECTED AGAIN: this now calls `GET /checkout/order/{orderReference}`
+    (see nomba_client.py's get_checkout_order_status for why — a team
+    member reproduced a real 404 on the endpoint this docstring
+    previously described as confirmed). No confirmed example response
+    body exists yet for THIS specific endpoint from any source. The
+    checks below were written for the other endpoint's confirmed shape
+    (`data.success` boolean, `data.message` /
+    `data.transactionDetails.statusCode`) but are deliberately kept —
+    they're harmless if absent, and the generic fallback field names
+    (status/orderStatus/paymentStatus) below them mean a genuinely
+    different response shape from this endpoint still has a real
+    chance of being read correctly. Worth confirming against one real
+    successful recovery once this is live rather than assuming either
+    shape.
     """
     if not event.recovery_checkout_order_id:
         return event

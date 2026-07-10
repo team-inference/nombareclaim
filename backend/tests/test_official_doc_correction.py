@@ -120,13 +120,19 @@ def test_webhook_ingestion_stores_naira_amount_directly_not_divided_by_100():
     assert detail["has_contact"] is True
 
 
-def test_checkout_path_prefix_and_root_host_are_environment_aware(monkeypatch):
+def test_checkout_url_is_same_path_structure_in_both_environments(monkeypatch):
+    # CORRECTED (again): checkout does NOT use a different path prefix
+    # per environment — a team member reproduced a real 404 hitting
+    # /sandbox/checkout/order against the actual hackathon sandbox,
+    # and the organizer's own "verified endpoints" reference lists
+    # only a single form, /v1/checkout/order, for both. Only the HOST
+    # differs between sandbox and production; _is_sandbox() is kept
+    # only for anything that genuinely does need to branch (none of
+    # the checkout functions do anymore).
     monkeypatch.setattr(settings, "NOMBA_API_BASE_URL", "https://sandbox.nomba.com/v1")
     assert nomba_client._is_sandbox() is True
-    assert nomba_client._checkout_path_prefix() == "/sandbox/checkout"
-    assert nomba_client._root_host() == "https://sandbox.nomba.com"
+    assert f"{settings.NOMBA_API_BASE_URL}/checkout/order" == "https://sandbox.nomba.com/v1/checkout/order"
 
     monkeypatch.setattr(settings, "NOMBA_API_BASE_URL", "https://api.nomba.com/v1")
     assert nomba_client._is_sandbox() is False
-    assert nomba_client._checkout_path_prefix() == "/v1/checkout"
-    assert nomba_client._root_host() == "https://api.nomba.com"
+    assert f"{settings.NOMBA_API_BASE_URL}/checkout/order" == "https://api.nomba.com/v1/checkout/order"
